@@ -1,0 +1,407 @@
+import numpy as np
+import scipy.io
+import os
+import re
+import tkinter as tk
+from tkinter import filedialog
+from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+import matplotlib.cm as cm
+
+# Function to extract temperature (for header and grouping)
+def extract_temperature(filename):
+    basename = os.path.basename(filename).replace('.mat', '')
+    if '#2' in basename:
+        return '#2'
+    temp_match = re.search(r"(\d+[cC]|\d+)", basename)
+    if temp_match:
+        temp = temp_match.group(1)
+        return f"{temp}" if temp.lower().endswith('c') else f"{temp}C"
+    return basename
+
+# Function to clean base filename
+def clean_base_filename(filename):
+    basename = os.path.basename(filename).replace('.mat', '')
+    patterns = [r"Sag_\d+[cC]_", r"Sag_\d+#\d_", r"Sag_\d+_"]
+    for pattern in patterns:
+        basename = re.sub(pattern, '', basename)
+    return basename
+
+# Tkinter file selection
+try:
+    root = tk.Tk()
+    root.withdraw()
+    file_paths = filedialog.askopenfilenames(
+        title="Select one or more .mat files",
+        filetypes=[("MATLAB files", "*.mat")]
+    )
+    root.destroy()
+except Exception as e:
+    print(f"❌ Error in file selection dialog: {e}. Exiting.")
+    exit()
+
+if not file_paths:
+    print(f"❌ No files selected. Exiting.")
+    exit()
+
+# Group pulses by temperature
+temperature_pulses = {}
+
+# Process each file
+for file_path in file_paths:
+    # Get base filename and temperature
+    base_filename = clean_base_filename(file_path)
+    temperature = extract_temperature(file_path)
+    
+    # Get output directory (Sag_Rising subfolder)
+    input_dir = os.path.dirname(file_path)
+    output_dir = os.path.join(input_dir, "Sag_Rising")
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    # Load .mat file
+    try:
+        data = scipy.io.loadmat(file_path)
+    except Exception as e:
+        print(f"❌ Error loading {file_path}: {e}")
+        continue
+    
+    # Detect voltage and current keys
+    voltage_key = next((k for k in data if "Voltage" in k), None)
+    current_key = next((k for k in data if "Current" in k), None)
+    if not voltage_key or not current_key:
+        print(f"❌ Voltage or Current data not found in {base_filename}!")
+        continue
+    
+    # Extract data
+    voltage_data = data[voltage_key][0, 0]
+    current_data = data[current_key][0, 0]
+    
+    voltage_time = np.arange(0, voltage_data['length'][0][0] * voltage_data['interval'][0][0], 
+                            voltage_data['interval'][0][0])[:len(voltage_data['values'])]
+    current_time = np.arange(0, current_data['length'][0][0] * current_data['interval'][0][0], 
+                            current_data['interval'][0][0])[:len(current_data['values'])]
+    voltage_values = data[voltage_key][0,0]['values'].flatten()
+    current_values = data[current_key][0,0]['values'].flatten()
+    
+    # Interpolate current to voltage time
+    try:
+        interp_func = interp1d(current_time, current_values, kind='linear', fill_value='extrapolate')
+        current_values_resampled = interp_func(voltage_time)
+    except Exception as e:
+        print(f"❌ Error interpolating current in {file_path}: {e}")
+        continue
+    
+    # Verify array lengths
+    if len(voltage_time) != len(current_values_resampled):
+        print(f"❌ Length mismatch after interpolation in {base_filename}: "
+              f"voltage_time ({len(voltage_time)}), current_values_resampled ({len(current_values_resampled)})")
+        continue
+    
+    # Normalize current to zero baseline
+    baseline_current = np.mean(current_values_resampled[voltage_time < 10])
+    current_values_normalized = current_values_resampled - baseline_current
+    print(f"ℹ️ Baseline current for {base_filename} ({temperature}): {baseline_current:.2f} pA")
+    
+    # Thresholds for -10 pA pulses
+    start_threshold = -5   # Start pulse at -5 pA
+    rise_threshold = -2    # Align at current rise (-2 pA upward)
+    min_pulse_duration = 0.1
+    target_pulse_duration = 3.0
+    duration_tolerance = 0.7  # ±0.7 s
+    min_amplitude = -8.0  # Minimum pulse amplitude
+    refractory_period = 1.0  # Seconds after rise to skip
+    
+    # Detect sag pulses
+    steps = []
+    i = 1
+    while i < len(current_values_normalized) - 1:
+        # Detect pulse start
+        if (current_values_normalized[i] < start_threshold and 
+            current_values_normalized[i - 1] >= start_threshold):
+            start_time = voltage_time[i]
+            print(f"ℹ️ Pulse start detected in {base_filename} ({temperature}) at {start_time:.2f}s, current: {current_values_normalized[i]:.2f} pA")
+            
+            # Look for rise within 5 seconds
+            j = i
+            rise_time = None
+            while j < len(current_values_normalized) and (voltage_time[j] - start_time) <= 5:
+                if (current_values_normalized[j] >= rise_threshold and 
+                    current_values_normalized[j - 1] < rise_threshold):
+                    rise_time = voltage_time[j]
+                    break
+                j += 1
+            
+            if rise_time is not None:
+                duration = rise_time - start_time
+                amplitude = np.min(current_values_normalized[(voltage_time >= start_time) & (voltage_time <= rise_time)])
+                if (duration >= min_pulse_duration and 
+                    abs(duration - target_pulse_duration) <= duration_tolerance and 
+                    amplitude < min_amplitude):
+                    steps.append({
+                        'start_time': start_time,
+                        'rise_time': rise_time,
+                        'amplitude': amplitude,
+                        'duration': duration
+                    })
+                    print(f"ℹ️ Pulse detected in {base_filename} ({temperature}) at {start_time:.2f}s, duration: {duration:.2f}s, amplitude: {amplitude:.2f} pA, rise current: {current_values_normalized[j]:.2f} pA")
+                    # Move to end of refractory period
+                    while j < len(voltage_time) and (voltage_time[j] - rise_time) < refractory_period:
+                        j += 1
+                    i = j
+                else:
+                    print(f"⚠️ Pulse in {base_filename} ({temperature}) at {start_time:.2f}s invalid (duration: {duration:.2f}s, amplitude: {amplitude:.2f} pA)")
+                    i = j
+            else:
+                print(f"⚠️ Pulse in {base_filename} ({temperature}) at {start_time:.2f}s not rising after 5s, discarding.")
+                i += 1
+        else:
+            i += 1
+    
+    # Log if no pulses detected
+    if not steps:
+        print(f"⚠️ No valid pulses detected in {base_filename} ({temperature}). "
+              f"Baseline current: {baseline_current:.2f} pA, Start threshold: {start_threshold:.2f} pA, "
+              f"Rise threshold: {rise_threshold:.2f} pA, Normalized current range: "
+              f"{np.min(current_values_normalized):.2f} to {np.max(current_values_normalized):.2f} pA")
+        
+        # Diagnostic plot of current trace
+        plt.figure(figsize=(12, 6))
+        plt.plot(voltage_time, current_values_normalized, 'b-', label='Normalized Current')
+        plt.axhline(start_threshold, color='red', linestyle='--', label='Start Threshold (-5 pA)')
+        plt.axhline(rise_threshold, color='green', linestyle='--', label='Rise Threshold (-2 pA)')
+        plt.xlabel('Time (s)')
+        plt.ylabel('Normalized Current (pA)')
+        plt.title(f'Current Trace - {base_filename} ({temperature})')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+    
+    # Analyze each step and write to file
+    output_filename = f"{base_filename}_{temperature}_sag_analysis.txt"
+    output_path = os.path.join(output_dir, output_filename)
+    with open(output_path, 'w', encoding='utf-8', newline='\r\n') as f:
+        f.write(f"Original Data File: {base_filename}\n")
+        f.write(f"Temperature: {temperature}\n")
+        f.write("\n--- Sag Pulse Analysis ---\n")
+        f.write(f"{'Pulse':<10}\t{'Amplitude (pA)':<15}\t{'Baseline (mV)':<15}\t{'Recovery (mV)':<15}\t{'Tau Time (ms)':<15}\t{'80% Time (ms)':<15}\n")
+        
+        for pulse_idx, step in enumerate(steps, 1):
+            print(f"ℹ️ Processing pulse {pulse_idx} in {base_filename} ({temperature})")
+            
+            # Validate step data
+            if not all(k in step for k in ['start_time', 'rise_time', 'amplitude']):
+                print(f"⚠️ Pulse {pulse_idx} in {base_filename} ({temperature}): Invalid step data, skipping.")
+                continue
+            
+            # Extract voltage trace
+            step_mask = (voltage_time >= step['start_time'] - 0.7) & (voltage_time <= step['rise_time'] + 2.0)
+            step_time = voltage_time[step_mask] - step['rise_time']
+            step_voltage = voltage_values[step_mask]
+            
+            print(f"ℹ️ Pulse {pulse_idx} in {base_filename} ({temperature}): Time range {step_time[0] if len(step_time) > 0 else 'N/A':.2f} to {step_time[-1] if len(step_time) > 0 else 'N/A':.2f}s, {len(step_time)} points")
+            
+            # Resample to standard time grid
+            standard_time = np.arange(-0.5, 1.001, 0.001)
+            try:
+                interp_func = interp1d(step_time, step_voltage, kind='linear', 
+                                      fill_value=(step_voltage[0], step_voltage[-1]) if len(step_voltage) > 0 else np.nan)
+                step_voltage_resampled = interp_func(standard_time)
+            except ValueError as e:
+                print(f"⚠️ Pulse {pulse_idx} in {base_filename} ({temperature}): Interpolation failed ({e}), logging with NaN values.")
+                step_voltage_resampled = np.full_like(standard_time, np.nan)
+            
+            # Calculate metrics
+            baseline_mask = (standard_time >= -0.5) & (standard_time < 0)
+            baseline_voltage = np.mean(step_voltage_resampled[baseline_mask]) if np.any(baseline_mask) and not np.all(np.isnan(step_voltage_resampled[baseline_mask])) else np.nan
+            
+            recovery_mask = (standard_time >= 0.5) & (standard_time < 1.0)
+            recovery_voltage = np.mean(step_voltage_resampled[recovery_mask]) if np.any(recovery_mask) and not np.all(np.isnan(step_voltage_resampled[recovery_mask])) else np.nan
+            
+            voltage_diff = recovery_voltage - baseline_voltage if not (np.isnan(recovery_voltage) or np.isnan(baseline_voltage)) else np.nan
+            
+            tau_time = np.nan
+            eighty_percent_time = np.nan
+            if not np.isnan(voltage_diff) and voltage_diff != 0:
+                tau_threshold = baseline_voltage + 0.632 * voltage_diff
+                eighty_percent_threshold = baseline_voltage + 0.8 * voltage_diff
+                
+                rising_mask = (standard_time >= 0) & (standard_time <= 1.0)
+                rising_time = standard_time[rising_mask]
+                rising_voltage = step_voltage_resampled[rising_mask]
+                
+                for j in range(1, len(rising_voltage)):
+                    if not np.isnan(rising_voltage[j - 1]) and not np.isnan(rising_voltage[j]):
+                        if rising_voltage[j - 1] <= tau_threshold and rising_voltage[j] > tau_threshold:
+                            t0, t1 = rising_time[j - 1], rising_time[j]
+                            v0, v1 = rising_voltage[j - 1], rising_voltage[j]
+                            tau_time = t0 + (tau_threshold - v0) * (t1 - t0) / (v1 - v0)
+                            tau_time *= 1000
+                            break
+                
+                for j in range(1, len(rising_voltage)):
+                    if not np.isnan(rising_voltage[j - 1]) and not np.isnan(rising_voltage[j]):
+                        if rising_voltage[j - 1] <= eighty_percent_threshold and rising_voltage[j] > eighty_percent_threshold:
+                            t0, t1 = rising_time[j - 1], rising_time[j]
+                            v0, v1 = rising_voltage[j - 1], rising_voltage[j]
+                            eighty_percent_time = t0 + (eighty_percent_threshold - v0) * (t1 - t0) / (v1 - v0)
+                            eighty_percent_time *= 1000
+                            break
+            
+            # Store pulse data for plots
+            if temperature not in temperature_pulses:
+                temperature_pulses[temperature] = []
+            temperature_pulses[temperature].append({
+                'step_time': standard_time,
+                'step_voltage': step_voltage_resampled,
+                'recovery_voltage': recovery_voltage,
+                'pulse_idx': pulse_idx,
+                'base_filename': base_filename
+            })
+            
+            # Write to file
+            print(f"ℹ️ Writing pulse {pulse_idx} to {output_path}: Amplitude={step['amplitude']:.2f}, "
+                  f"Baseline={'NaN' if np.isnan(baseline_voltage) else f'{baseline_voltage:.2f}'}, "
+                  f"Recovery={'NaN' if np.isnan(recovery_voltage) else f'{recovery_voltage:.2f}'}, "
+                  f"Tau={'NaN' if np.isnan(tau_time) else f'{tau_time:.2f}'}, "
+                  f"80%={'NaN' if np.isnan(eighty_percent_time) else f'{eighty_percent_time:.2f}'}")
+            line = f"{pulse_idx:<10}\t"
+            line += f"{step['amplitude']:<15.2f}\t"
+            line += f"{baseline_voltage:<15.2f}\t" if not np.isnan(baseline_voltage) else "NaN\t"
+            line += f"{recovery_voltage:<15.2f}\t" if not np.isnan(recovery_voltage) else "NaN\t"
+            line += f"{tau_time:<15.2f}\t" if not np.isnan(tau_time) else "NaN\t"
+            line += f"{eighty_percent_time:<15.2f}\n" if not np.isnan(eighty_percent_time) else "NaN\n"
+            f.write(line)
+    
+    print(f"✅ Saved sag analysis with {len(steps)} pulses to: {output_path}")
+    
+    # Generate PDF plots for each temperature
+    if temperature in temperature_pulses and temperature_pulses[temperature]:
+        pdf_path = os.path.join(output_dir, f"{temperature}_all_pulses.pdf")
+        with PdfPages(pdf_path) as pdf:
+            plt.figure(figsize=(10, 6))
+            pulses = temperature_pulses[temperature]
+            colors = cm.tab10(np.linspace(0, 1, len(pulses)))
+            min_voltage = min([np.min(p['step_voltage']) for p in pulses if not np.all(np.isnan(p['step_voltage']))])
+            for idx, pulse in enumerate(pulses):
+                if not np.all(np.isnan(pulse['step_voltage'])):
+                    plt.plot(pulse['step_time'], pulse['step_voltage'], color=colors[idx], 
+                             label=f"Pulse {pulse['pulse_idx']} ({pulse['base_filename']})")
+                    plt.axhline(pulse['recovery_voltage'], color=colors[idx], linestyle='--', 
+                                label=f"Mean {pulse['pulse_idx']}: {pulse['recovery_voltage']:.2f} mV" if not np.isnan(pulse['recovery_voltage']) else f"Mean {pulse['pulse_idx']}: NaN")
+            plt.xlim(-0.2, 0.4)
+            plt.ylim(min_voltage, -60)
+            plt.xlabel('Time Relative to Current Rise (s)')
+            plt.ylabel('Voltage (mV)')
+            plt.title(f'All Sag Pulses - Temperature {temperature}')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            pdf.savefig()
+            plt.close()
+        print(f"✅ Saved all pulses plot to: {pdf_path}")
+    
+    # Generate individual plots
+    for pulse_idx, step in enumerate(steps, 1):
+        step_mask = (voltage_time >= step['start_time'] - 0.7) & (voltage_time <= step['rise_time'] + 2.0)
+        step_time = voltage_time[step_mask] - step['rise_time']
+        step_voltage = voltage_values[step_mask]
+        
+        standard_time = np.arange(-0.5, 1.001, 0.001)
+        try:
+            interp_func = interp1d(step_time, step_voltage, kind='linear', 
+                                  fill_value=(step_voltage[0], step_voltage[-1]) if len(step_voltage) > 0 else np.nan)
+            step_voltage_resampled = interp_func(standard_time)
+        except ValueError as e:
+            print(f"⚠️ Pulse {pulse_idx} in {base_filename} ({temperature}): Interpolation failed for individual plot ({e}), skipping plot.")
+            continue
+        
+        baseline_mask = (standard_time >= -0.5) & (standard_time < 0)
+        baseline_voltage = np.mean(step_voltage_resampled[baseline_mask]) if np.any(baseline_mask) and not np.all(np.isnan(step_voltage_resampled[baseline_mask])) else np.nan
+        
+        recovery_mask = (standard_time >= 0.5) & (standard_time < 1.0)
+        recovery_voltage = np.mean(step_voltage_resampled[recovery_mask]) if np.any(recovery_mask) and not np.all(np.isnan(step_voltage_resampled[recovery_mask])) else np.nan
+        
+        voltage_diff = recovery_voltage - baseline_voltage if not (np.isnan(recovery_voltage) or np.isnan(baseline_voltage)) else np.nan
+        
+        tau_time = np.nan
+        eighty_percent_time = np.nan
+        if not np.isnan(voltage_diff) and voltage_diff != 0:
+            tau_threshold = baseline_voltage + 0.632 * voltage_diff
+            eighty_percent_threshold = baseline_voltage + 0.8 * voltage_diff
+            
+            rising_mask = (standard_time >= 0) & (standard_time <= 1.0)
+            rising_time = standard_time[rising_mask]
+            rising_voltage = step_voltage_resampled[rising_mask]
+            
+            for j in range(1, len(rising_voltage)):
+                if not np.isnan(rising_voltage[j - 1]) and not np.isnan(rising_voltage[j]):
+                    if rising_voltage[j - 1] <= tau_threshold and rising_voltage[j] > tau_threshold:
+                        t0, t1 = rising_time[j - 1], rising_time[j]
+                        v0, v1 = rising_voltage[j - 1], rising_voltage[j]
+                        tau_time = t0 + (tau_threshold - v0) * (t1 - t0) / (v1 - v0)
+                        tau_time *= 1000
+                        break
+            
+            for j in range(1, len(rising_voltage)):
+                if not np.isnan(rising_voltage[j - 1]) and not np.isnan(rising_voltage[j]):
+                    if rising_voltage[j - 1] <= eighty_percent_threshold and rising_voltage[j] > eighty_percent_threshold:
+                        t0, t1 = rising_time[j - 1], rising_time[j]
+                        v0, v1 = rising_voltage[j - 1], rising_voltage[j]
+                        eighty_percent_time = t0 + (eighty_percent_threshold - v0) * (t1 - t0) / (v1 - v0)
+                        eighty_percent_time *= 1000
+                        break
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(step_time, step_voltage, 'b-', label='Voltage Trace')
+        plt.axvspan(-0.5, 0, alpha=0.2, color='green', label='Baseline Window')
+        plt.axhline(baseline_voltage, color='green', linestyle='--', 
+                    label=f'Baseline: {baseline_voltage:.2f} mV' if not np.isnan(baseline_voltage) else 'Baseline: NaN')
+        plt.axvspan(0.5, 1.0, alpha=0.2, color='orange', label='Recovery Window')
+        plt.axhline(recovery_voltage, color='orange', linestyle='--', 
+                    label=f'Recovery: {recovery_voltage:.2f} mV' if not np.isnan(recovery_voltage) else 'Recovery: NaN')
+        if not np.isnan(tau_time):
+            plt.plot(tau_time / 1000, tau_threshold, 'ro', 
+                     label=f'Tau: {tau_time:.2f} ms')
+            plt.axvline(tau_time / 1000, color='red', linestyle=':', alpha=0.5)
+        if not np.isnan(eighty_percent_time):
+            plt.plot(eighty_percent_time / 1000, eighty_percent_threshold, 'mo', 
+                     label=f'80%: {eighty_percent_time:.2f} ms')
+            plt.axvline(eighty_percent_time / 1000, color='magenta', linestyle=':', alpha=0.5)
+        plt.xlim(-0.6, 1.1)
+        plt.xlabel('Time Relative to Current Rise (s)')
+        plt.ylabel('Voltage (mV)')
+        plt.title(f'Sag Pulse {pulse_idx} - {base_filename} ({temperature}), Amplitude: {step["amplitude"]:.2f} pA')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+# Generate overlap file for 25C and 33C
+print("ℹ️ Generating 25C vs 33C overlap file...")
+if '25C' in temperature_pulses or '33C' in temperature_pulses:
+    txt_path = os.path.join(output_dir, "25C_33C_sag_pulses_overlap.txt")
+    with open(txt_path, 'w', encoding='utf-8', newline='\r\n') as f:
+        # Write header
+        f.write("Time (s)\t")
+        for temp in ['25C', '33C']:
+            if temp in temperature_pulses:
+                for pulse in temperature_pulses[temp]:
+                    f.write(f"{temp}_Pulse_{pulse['pulse_idx']}_{pulse['base_filename']} (mV)\t")
+        f.write("\n")
+        
+        # Write data
+        standard_time = np.arange(-0.5, 1.001, 0.001)
+        for i, t in enumerate(standard_time):
+            f.write(f"{t:.3f}\t")
+            for temp in ['25C', '33C']:
+                if temp in temperature_pulses:
+                    for pulse in temperature_pulses[temp]:
+                        voltage = pulse['step_voltage'][i]
+                        f.write(f"{voltage:.2f}\t" if not np.isnan(voltage) else "NaN\t")
+            f.write("\n")
+    print(f"✅ Saved 25C vs 33C overlap file to: {txt_path}")
+else:
+    print(f"⚠️ Cannot generate 25C vs 33C overlap file: No pulses for 25C or 33C")
