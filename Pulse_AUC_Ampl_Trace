@@ -1,0 +1,300 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy.io
+from scipy.signal import find_peaks
+from scipy.interpolate import interp1d
+import tkinter as tk
+from tkinter import filedialog
+import os
+import re
+
+# Parameters
+CURRENT_THRESHOLD = 2.0  # pA above baseline to detect pulse
+MIN_PULSE_DURATION = 0.3  # Minimum pulse duration
+AMPLITUDE_TARGETS = [20, 40, 60]  # pA, target amplitudes
+AMPLITUDE_TOLERANCE = 2.5  # pA, tolerance for amplitude
+AP_RANGES = [(20, 30), (30, 40), (40, 50)]  # AP count ranges
+PRE_PULSE_WINDOW = 1.0  # s, time before pulse
+POST_PULSE_WINDOW = 5.0  # s, time after pulse (total 6 s)
+AP_HEIGHT_MIN = -10  # mV, minimum AP height
+AP_PROMINENCE = 0.5  # mV, prominence for AP detection
+EXPECTED_TRACE_DURATION = 6.0  # s, expected trace duration
+
+def select_files():
+    """Prompt user to select multiple .mat files."""
+    root = tk.Tk()
+    root.withdraw()
+    files = filedialog.askopenfilenames(
+        title="Select .mat files",
+        filetypes=[("MATLAB files", "*.mat")]
+    )
+    return list(files)
+
+def extract_temperature(filename):
+    """Extract temperature from filename (e.g., '25' from '25_AP_250000_WS-2.mat')."""
+    match = re.search(r'(\d+)_AP', filename)
+    return match.group(1) if match else 'Unknown'
+
+def load_mat_data(filename):
+    """Load voltage and current data from .mat file."""
+    try:
+        data = scipy.io.loadmat(filename)
+        voltage_key = next((k for k in data if "Voltage" in k), None)
+        current_key = next((k for k in data if "Current" in k), None)
+        if not voltage_key or not current_key:
+            print(f"❌ No Voltage or Current data found in {filename}!")
+            return None, None, None, None
+        
+        # Extract voltage data
+        voltage_data = data[voltage_key][0, 0]
+        voltage_values = np.ravel(voltage_data['values'])
+        try:
+            length = float(np.ravel(voltage_data['length'])[0])
+            interval = float(np.ravel(voltage_data['interval'])[0])
+        except Exception as e:
+            print(f"❌ Voltage length/interval error in {filename}: {e}")
+            return None, None, None, None
+        voltage_time = np.arange(0, length * interval, interval)[:len(voltage_values)]
+        
+        # Extract current data
+        current_data = data[current_key][0, 0]
+        try:
+            current_values = np.ravel(current_data['values'])
+            length = float(np.ravel(current_data['length'])[0])
+            interval = float(np.ravel(current_data['interval'])[0])
+        except Exception as e:
+            print(f"❌ Current data error in {filename}: {e}")
+            return None, None, None, None
+        current_time = np.arange(0, length * interval, interval)[:len(current_values)]
+        
+        if len(current_values) == 0 or len(voltage_values) == 0:
+            print(f"❌ Empty data arrays in {filename}!")
+            return None, None, None, None
+        
+        return voltage_time, voltage_values, current_time, current_values
+    except Exception as e:
+        print(f"❌ Error loading {filename}: {e}")
+        return None, None, None, None
+
+def interpolate_current(voltage_time, current_time, current_values):
+    """Interpolate current to match voltage time."""
+    try:
+        if not np.all(np.isfinite(current_values)):
+            raise ValueError("Current values contain non-finite values")
+        if len(current_time) < 2 or len(current_values) < 2:
+            raise ValueError("Insufficient data points for interpolation")
+        interp_func = interp1d(current_time, current_values, kind='linear', fill_value='extrapolate')
+        return interp_func(voltage_time)
+    except Exception as e:
+        print(f"❌ Interpolation error: {e}")
+        return None
+
+def detect_pulses(voltage_time, current_values):
+    """Detect current steps."""
+    try:
+        baseline_current = np.mean(current_values[voltage_time < 10])
+        current_threshold = baseline_current + CURRENT_THRESHOLD
+        steps = []
+        start_time = None
+        
+        for i in range(1, len(current_values)):
+            if current_values[i] > current_threshold and current_values[i-1] <= current_threshold:
+                start_time = voltage_time[i]
+            if current_values[i] <= current_threshold and current_values[i-1] > current_threshold and start_time is not None:
+                end_time = voltage_time[i]
+                if end_time - start_time >= MIN_PULSE_DURATION:
+                    amplitude = np.max(current_values[(voltage_time >= start_time) & (voltage_time <= end_time)]) - baseline_current
+                    steps.append({'start_time': start_time, 'end_time': end_time, 'amplitude': amplitude})
+                start_time = None
+        
+        return steps
+    except Exception as e:
+        print(f"❌ Pulse detection error: {e}")
+        return []
+
+def count_aps(voltage_time, voltage_values, start_time, end_time):
+    """Count APs within a pulse window."""
+    pulse_indices = (voltage_time >= start_time) & (voltage_time <= end_time)
+    pulse_voltage = voltage_values[pulse_indices]
+    ap_indices, _ = find_peaks(pulse_voltage, height=AP_HEIGHT_MIN, prominence=AP_PROMINENCE)
+    return len(ap_indices)
+
+def extract_pulse_trace(voltage_time, voltage_values, start_time, end_time):
+    """Extract voltage trace from 1 s before to 5 s after pulse."""
+    total_duration = PRE_PULSE_WINDOW + (end_time - start_time) + POST_PULSE_WINDOW
+    start_idx = np.searchsorted(voltage_time, start_time - PRE_PULSE_WINDOW)
+    end_idx = np.searchsorted(voltage_time, start_time - PRE_PULSE_WINDOW + total_duration)
+    
+    if end_idx > len(voltage_time):
+        end_idx = len(voltage_time)
+    
+    trace_time = voltage_time[start_idx:end_idx]
+    trace_voltage = voltage_values[start_idx:end_idx]
+    
+    # Adjust time to start at 0
+    trace_time = trace_time - trace_time[0]
+    
+    # Pad if trace is too short
+    if len(trace_time) < int(total_duration / (voltage_time[1] - voltage_time[0])):
+        pad_length = int(total_duration / (voltage_time[1] - voltage_time[0])) - len(trace_time)
+        trace_time = np.pad(trace_time, (0, pad_length), mode='edge')
+        trace_voltage = np.pad(trace_voltage, (0, pad_length), mode='edge')
+    
+    return trace_time, trace_voltage, total_duration
+
+def check_pulse_issues(amplitude, num_aps, trace_time, expected_duration, is_amplitude_based):
+    """Check for issues with the pulse."""
+    issues = []
+    
+    if is_amplitude_based:
+        if not any(abs(amplitude - target_amp) <= AMPLITUDE_TOLERANCE for target_amp in AMPLITUDE_TARGETS):
+            issues.append(f"Amplitude {amplitude:.1f}pA not in {AMPLITUDE_TARGETS}pA (±{AMPLITUDE_TOLERANCE}pA)")
+    else:
+        if not any(ap_min <= num_aps <= ap_max for ap_min, ap_max in AP_RANGES):
+            issues.append(f"AP count {num_aps} not in ranges {AP_RANGES}")
+    
+    if trace_time[-1] < expected_duration - 0.1:
+        issues.append(f"Short trace: {trace_time[-1]:.2f}s < {expected_duration}s")
+    
+    return issues
+
+def save_trace(trace_time, trace_voltage, output_path):
+    """Save voltage trace to .txt file with tab delimiter."""
+    with open(output_path, 'w') as f:
+        f.write("Time_s\tVoltage_mV\n")
+        for t, v in zip(trace_time, trace_voltage):
+            f.write(f"{t:.6f}\t{v:.2f}\n")
+    print(f"✅ Saved to {output_path}")
+
+def process_file(filename):
+    """Process a single .mat file and create a montage."""
+    print(f"\nProcessing file: {filename}")
+    temp = extract_temperature(os.path.basename(filename))
+    base_name = os.path.splitext(os.path.basename(filename))[0]
+    
+    # Create output directories
+    output_base = os.path.dirname(filename)
+    amplitude_dir = os.path.join(output_base, f"Amplitude_Pulses_{temp}")
+    ap_count_dir = os.path.join(output_base, f"AP_Count_Pulses_{temp}")
+    os.makedirs(amplitude_dir, exist_ok=True)
+    os.makedirs(ap_count_dir, exist_ok=True)
+    
+    # Load data
+    voltage_time, voltage_values, current_time, current_values = load_mat_data(filename)
+    if voltage_time is None:
+        return
+    
+    # Interpolate current
+    current_values_resampled = interpolate_current(voltage_time, current_time, current_values)
+    if current_values_resampled is None:
+        return
+    
+    # Detect pulses
+    steps = detect_pulses(voltage_time, current_values_resampled)
+    if not steps:
+        print(f"No pulses detected in {filename}")
+        return
+    
+    # Organize pulses (only first pulse per criterion)
+    amplitude_pulses = {amp: None for amp in AMPLITUDE_TARGETS}
+    ap_range_pulses = {f"{r[0]}-{r[1]}": None for r in AP_RANGES}
+    
+    for step in steps:
+        amplitude = step['amplitude']
+        start_time = step['start_time']
+        end_time = step['end_time']
+        num_aps = count_aps(voltage_time, voltage_values, start_time, end_time)
+        trace_time, trace_voltage, total_duration = extract_pulse_trace(voltage_time, voltage_values, start_time, end_time)
+        
+        # Amplitude-based pulses
+        for target_amp in AMPLITUDE_TARGETS:
+            if abs(amplitude - target_amp) <= AMPLITUDE_TOLERANCE and amplitude_pulses[target_amp] is None:
+                issues = check_pulse_issues(amplitude, num_aps, trace_time, total_duration, is_amplitude_based=True)
+                if issues:
+                    print(f"Amplitude pulse in {filename}: {', '.join(issues)}")
+                output_path = os.path.join(amplitude_dir, f"{temp}C_AmplitudeTask_{target_amp}pA_Pulse.txt")
+                amplitude_pulses[target_amp] = {
+                    'trace_time': trace_time,
+                    'trace_voltage': trace_voltage,
+                    'num_aps': num_aps,
+                    'pulse_num': 1,
+                    'output_path': output_path,
+                    'issues': issues
+                }
+                save_trace(trace_time, trace_voltage, output_path)
+        
+        # AP-based pulses
+        for ap_min, ap_max in AP_RANGES:
+            ap_range = f"{ap_min}-{ap_max}"
+            if ap_min <= num_aps <= ap_max and ap_range_pulses[ap_range] is None:
+                issues = check_pulse_issues(amplitude, num_aps, trace_time, total_duration, is_amplitude_based=False)
+                if issues:
+                    print(f"AP pulse in {filename}: {', '.join(issues)}")
+                output_path = os.path.join(ap_count_dir, f"{temp}C_APulsesTask_{ap_min}-{ap_max}APs_Pulse.txt")
+                ap_range_pulses[ap_range] = {
+                    'trace_time': trace_time,
+                    'trace_voltage': trace_voltage,
+                    'num_aps': num_aps,
+                    'pulse_num': 1,
+                    'output_path': output_path,
+                    'issues': issues
+                }
+                save_trace(trace_time, trace_voltage, output_path)
+    
+    # Create montage
+    categories = [(f"AmplitudeTask_{amp}pA", amplitude_pulses[amp]) for amp in AMPLITUDE_TARGETS] + \
+                 [(f"APulsesTask_{r[0]}-{r[1]}APs", ap_range_pulses[f"{r[0]}-{r[1]}"]) for r in AP_RANGES]
+    num_rows = len(categories)
+    max_pulses = 1  # One pulse per criterion
+    
+    fig, axes = plt.subplots(num_rows, max_pulses, figsize=(5 * max_pulses, 4 * num_rows), sharex=True, sharey=True)
+    if num_rows == 1:
+        axes = np.array([axes])
+    else:
+        axes = axes.reshape(num_rows, -1)
+    
+    # Determine y-axis limits
+    all_voltages = []
+    for _, pulse in categories:
+        if pulse:
+            all_voltages.extend(pulse['trace_voltage'])
+    vmin, vmax = np.min(all_voltages) - 5, np.max(all_voltages) + 5 if all_voltages else (-100, 50)
+    
+    for row, (category, pulse) in enumerate(categories):
+        ax = axes[row, 0]
+        if pulse:
+            trace_time = pulse['trace_time']
+            trace_voltage = pulse['trace_voltage']
+            num_aps = pulse['num_aps']
+            issues = pulse['issues']
+            issues_str = f" | Issues: {', '.join(issues)}" if issues else ""
+            
+            ax.plot(trace_time, trace_voltage, 'b-', linewidth=1)
+            ax.axvspan(PRE_PULSE_WINDOW, PRE_PULSE_WINDOW + (steps[0]['end_time'] - steps[0]['start_time']),
+                      color='lightgreen', alpha=0.5)
+            ax.set_title(f"{temp}C_{category}_Pulse_{num_aps}APs{issues_str}",
+                        fontsize=10, pad=5)
+            ax.grid(True, linestyle='--', alpha=0.7)
+            ax.set_ylim(vmin, vmax)
+        else:
+            ax.axis('off')
+        
+        ax.set_ylabel('Voltage (mV)', fontsize=10)
+    
+    axes[-1, 0].set_xlabel('Time (s)', fontsize=10)
+    
+    plt.suptitle(f"Pulse Montage for {base_name} ({temp}°C)", fontsize=14)
+    plt.subplots_adjust(left=0.05, right=0.95, top=0.9, bottom=0.1, wspace=0.2, hspace=0.3)
+    plt.show()
+
+def main():
+    files = select_files()
+    if not files:
+        print("❌ No files selected!")
+        return
+    
+    for file in files:
+        process_file(file)
+
+if __name__ == "__main__":
+    main()
