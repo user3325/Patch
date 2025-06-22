@@ -1,0 +1,374 @@
+import scipy.io
+import numpy as np
+import matplotlib.pyplot as plt
+from tkinter import Tk
+from tkinter.filedialog import askopenfilenames
+from scipy.ndimage import gaussian_filter1d
+from scipy.optimize import curve_fit
+import os
+
+# === File Dialog ===
+Tk().withdraw()
+mat_file_paths = askopenfilenames(title="Select .mat files", filetypes=[("MATLAB files", "*.mat")])
+if not mat_file_paths:
+    raise ValueError("No files selected.")
+
+for mat_file_path in mat_file_paths:
+    print(f"Loading file: {mat_file_path}")
+    mat_data = scipy.io.loadmat(mat_file_path)
+
+    # === Extract channels via 'values' field ===
+    channels = []
+    for key, value in mat_data.items():
+        if key.startswith("__"):
+            continue
+        if isinstance(value, np.ndarray) and value.shape == (1, 1):
+            struct = value[0, 0]
+            if 'values' in struct.dtype.names:
+                data = struct['values'].flatten()
+                channels.append((key, data))
+                print(f"Extracted '{key}' with {len(data)} points.")
+
+    # === Sort and assign channels ===
+    channels.sort(key=lambda x: len(x[1]), reverse=True)
+    if len(channels) < 2:
+        raise ValueError("Less than 2 usable channels found.")
+
+    voltage_key, voltage = channels[0]
+    current_key, current = channels[1]
+    print(f"Debug: Voltage channel '{voltage_key}' has {len(voltage)} points")
+    print(f"Debug: Current channel '{current_key}' has {len(current)} points")
+
+    # === Define sampling rates ===
+    voltage_fs = 20000  # Hz
+    current_fs = 2000   # Hz
+
+    # === Create time vectors ===
+    t_voltage = np.arange(len(voltage)) / voltage_fs
+    t_current = np.arange(len(current)) / current_fs
+
+    # === Smooth the current trace ===
+    sigma_value = 10
+    smoothed_current = gaussian_filter1d(current, sigma=sigma_value)
+
+    # === Detect Negative Current Steps ===
+    baseline = np.median(smoothed_current)
+    delta_current = smoothed_current - baseline
+    threshold = -1.0  # pA
+    print(f"Debug: Current baseline: {baseline:.2f} pA, Threshold: {threshold} pA")
+
+    negative_steps_start = np.where(delta_current < threshold)[0]
+    print(f"Debug: {len(negative_steps_start)} points below threshold")
+
+    # === Group into steps ===
+    steps = []
+    current_step_start = None
+    fixed_duration = int(0.5 * current_fs)  # 500 ms
+
+    for i in range(1, len(negative_steps_start)):
+        if negative_steps_start[i] - negative_steps_start[i - 1] == 1:
+            if current_step_start is None:
+                current_step_start = negative_steps_start[i - 1]
+        else:
+            if current_step_start is not None:
+                steps.append((current_step_start, current_step_start + fixed_duration))
+            current_step_start = None
+
+    if len(negative_steps_start) > 0 and current_step_start is not None:
+        steps.append((current_step_start, current_step_start + fixed_duration))
+
+    print(f"Debug: {len(steps)} total steps detected")
+
+    # === Calculate Amplitudes ===
+    step_amplitudes = []
+    for start, end in steps:
+        amp = np.min(smoothed_current[int(start):int(end)]) - baseline
+        step_amplitudes.append(amp)
+
+    # === Group steps (only -10pA) ===
+    tolerance = 2.0
+    amplitude_groups = {'-10pA': []}
+
+    for i, amp in enumerate(step_amplitudes):
+        if abs(amp + 10) <= tolerance:
+            amplitude_groups['-10pA'].append(i)
+
+    print(f"Debug: Amplitude groups: -10pA: {len(amplitude_groups['-10pA'])} steps")
+
+    # === Display Detected -10pA Pulses ===
+    if not amplitude_groups['-10pA']:
+        raise ValueError("No -10pA pulses detected.")
+
+    print("\nDetected -10pA Pulses:")
+    print(f"{'Pulse':<6}{'Start Time (s)':<20}{'End Time (s)':<20}{'Amplitude (pA)'}")
+    print("-" * 50)
+    pulse_map = {}
+    for idx, pulse_idx in enumerate(amplitude_groups['-10pA']):
+        start, end = steps[pulse_idx]
+        amp = step_amplitudes[pulse_idx]
+        print(f"{idx+1:<6}{t_current[start]:<20.3f}{t_current[end]:<20.3f}{amp:<20.2f}")
+        pulse_map[idx + 1] = pulse_idx
+
+        # === Plot Individual Pulse ===
+        pre_window = 0.2
+        post_window = 0.7
+        pre_samples_current = int(pre_window * current_fs)
+        post_samples_current = int(post_window * current_fs)
+        pre_samples_voltage = int(pre_window * voltage_fs)
+        post_samples_voltage = int(post_window * voltage_fs)
+
+        start_idx_current = start
+        start_idx_voltage = int(t_current[start] * voltage_fs)
+        current_segment = current[max(0, start_idx_current - pre_samples_current):start_idx_current + post_samples_current]
+        voltage_segment = voltage[max(0, start_idx_voltage - pre_samples_voltage):start_idx_voltage + post_samples_voltage]
+        time_current_segment = np.linspace(-pre_window, post_window, len(current_segment))
+        time_voltage_segment = np.linspace(-pre_window, post_window, len(voltage_segment))
+
+        plt.figure(figsize=(12, 6))
+        plt.subplot(2, 1, 1)
+        plt.plot(time_current_segment, current_segment, label="Current (pA)", color='blue')
+        plt.axvspan(t_current[start] - t_current[start_idx_current], t_current[end] - t_current[start_idx_current], color='lightcoral', alpha=0.5)
+        plt.title(f"Pulse {idx+1} (-10pA) - Current Trace")
+        plt.xlabel("Time (s)")
+        plt.ylabel("Current (pA)")
+        plt.legend()
+        plt.grid(True)
+
+        plt.subplot(2, 1, 2)
+        plt.plot(time_voltage_segment, voltage_segment, label="Voltage (mV)", color='purple')
+        plt.axvspan(t_current[start] - t_current[start_idx_current], t_current[end] - t_current[start_idx_current], color='lightcoral', alpha=0.5)
+        plt.title(f"Pulse {idx+1} (-10pA) - Voltage Trace")
+        plt.xlabel("Time (s)")
+        plt.ylabel("Voltage (mV)")
+        plt.legend()
+        plt.grid(True)
+
+        plt.tight_layout()
+        plt.show()
+
+    # === Manual Selection of Pulses ===
+    selected_indices = []
+    while True:
+        try:
+            selection = input("\nEnter pulse numbers to process (e.g., '1,3,5' or 'all' or 'none' to exit): ").strip()
+            if selection.lower() == 'none':
+                break
+            elif selection.lower() == 'all':
+                selected_indices = amplitude_groups['-10pA']
+                break
+            else:
+                indices = [int(x) for x in selection.split(',')]
+                if all(1 <= x <= len(amplitude_groups['-10pA']) for x in indices):
+                    selected_indices = [pulse_map[x] for x in indices]
+                    break
+                else:
+                    print(f"Please enter numbers between 1 and {len(amplitude_groups['-10pA'])}.")
+        except ValueError:
+            print("Invalid input. Use comma-separated numbers, 'all', or 'none'.")
+
+    if not selected_indices:
+        raise ValueError("No pulses selected for processing.")
+
+    print(f"Selected {len(selected_indices)} -10pA pulses for processing.")
+
+    # === Define exponential function ===
+    def exp_func_fixed_baseline(t, A, tau):
+        return A * (1 - np.exp(-t / tau))
+
+    # === Plot & Fit Function ===
+    def plot_average_voltage_with_fit(step_indices, label, params_list):
+        aligned_voltages = []
+        pre_window = 0.2
+        post_window = 0.7
+        pre_samples = int(pre_window * voltage_fs)
+        post_samples = int(post_window * voltage_fs)
+        expected_length = pre_samples + post_samples
+
+        print(f"Debug: Processing {len(step_indices)} steps for {label}")
+        print(f"Debug: Expected voltage segment length: {expected_length} samples")
+
+        for idx in step_indices:
+            start_current, _ = steps[idx]
+            t_start = t_current[start_current]
+            start_idx = int(t_start * voltage_fs)
+            start_cut = max(0, start_idx - pre_samples)
+            end_cut = min(len(voltage), start_idx + post_samples)
+            segment = voltage[start_cut:end_cut]
+            if len(segment) == expected_length:
+                aligned_voltages.append(segment)
+            else:
+                print(f"Debug: Skipping step {idx} for {label}: segment length {len(segment)}, expected {expected_length}, start_cut={start_cut}, end_cut={end_cut}")
+
+        print(f"Debug: {len(aligned_voltages)} valid voltage segments found for {label}")
+
+        if not aligned_voltages:
+            print(f"No valid voltage segments found for {label}.")
+            return
+
+        voltage_matrix = np.array(aligned_voltages)
+        mean_voltage = np.mean(voltage_matrix, axis=0)
+        time_axis = np.linspace(-pre_window, post_window, len(mean_voltage))
+
+        # Baseline
+        baseline_mask = (time_axis >= -0.2) & (time_axis <= 0.0)
+        baseline_voltage = np.mean(mean_voltage[baseline_mask])
+
+        # Fit region
+        fit_mask = (time_axis >= 0.0) & (time_axis <= 0.45)
+        t_fit = time_axis[fit_mask]
+        v_fit = mean_voltage[fit_mask] - baseline_voltage
+
+        A_guess = v_fit[-1]
+        tau_guess = 0.05
+
+        try:
+            popt, _ = curve_fit(exp_func_fixed_baseline, t_fit, v_fit, p0=[A_guess, tau_guess])
+            A_fit, tau_fit = popt
+            fit_curve = exp_func_fixed_baseline(t_fit, *popt) + baseline_voltage
+
+            rmse = np.sqrt(np.mean((mean_voltage[fit_mask] - fit_curve) ** 2))
+            ss_res = np.sum((mean_voltage[fit_mask] - fit_curve) ** 2)
+            ss_tot = np.sum((mean_voltage[fit_mask] - np.mean(mean_voltage[fit_mask])) ** 2)
+            r_squared = 1 - (ss_res / ss_tot)
+
+            delta_I = 10.0
+            input_resistance = abs(A_fit / delta_I)
+            input_resistance_ohms = input_resistance * 1e9
+
+            capacitance = abs(tau_fit / input_resistance_ohms) if input_resistance_ohms > 0 else 0
+            capacitance_nF = capacitance * 1e9
+
+            params_list.append({
+                'Amplitude': label,
+                'Baseline_Voltage_mV': baseline_voltage,
+                'A_delta_V_mV': A_fit,
+                'Tau_s': tau_fit,
+                'Input_Resistance_GOhm': input_resistance,
+                'Capacitance_nF': capacitance_nF,
+                'RMSE_mV': rmse,
+                'R_squared': r_squared
+            })
+            print(f"Debug: Parameters successfully stored for {label}")
+
+            # === Plot Overview ===
+            plt.figure(figsize=(12, 6))
+            plt.plot(t_current, current, label="Current (pA)", color='blue', alpha=0.7)
+            plt.plot(t_voltage, voltage, label="Voltage (mV)", color='purple', alpha=0.7)
+            for idx in step_indices:
+                start, end = steps[idx]
+                plt.axvspan(t_current[start], t_current[end], color='lightcoral', alpha=0.5)
+            plt.title(f"Current & Voltage with Selected -10pA Steps")
+            plt.xlabel("Time (s)")
+            plt.ylabel("Amplitude")
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.show()
+
+            # === Plot Average Voltage with Fit ===
+            plt.figure(figsize=(12, 4))
+            plt.plot(time_axis, mean_voltage, label="Average Voltage", color='purple')
+            plt.plot(t_fit, fit_curve, label="Exponential Fit", color='red')
+            plt.axhline(baseline_voltage, color='gray', linestyle='--', alpha=0.5)
+            plt.title(f"Fit of Average Voltage Trace ({label})")
+            plt.xlabel("Time (s)")
+            plt.ylabel("Voltage (mV)")
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.show()
+
+            # === Print Fit Results ===
+            print(f"\nExponential Fit Results for {label}:")
+            print(f"{'-'*40}")
+            print(f"Baseline Voltage:     {baseline_voltage:.4f} mV")
+            print(f"A (delta V):          {A_fit:.4f} mV")
+            print(f"Tau (τ):              {tau_fit:.4f} s")
+            print(f"Input Resistance:     {input_resistance:.4f} GΩ")
+            print(f"Capacitance:          {capacitance_nF:.4f} nF")
+            print(f"RMSE:                 {rmse:.4f} mV")
+            print(f"R²:                   {r_squared:.4f}")
+
+            # === Save to .txt (Time and Voltage) ===
+            output_filename = os.path.join(
+                os.path.dirname(mat_file_path),
+                f"{os.path.splitext(os.path.basename(mat_file_path))[0]}_average10pA.txt"
+            )
+            data_to_save = np.column_stack((time_axis, mean_voltage))
+            np.savetxt(
+                output_filename,
+                data_to_save,
+                fmt='%.6f',
+                delimiter='\t',
+                header='Time (s)\tVoltage (mV)',
+                comments='# '
+            )
+            print(f"Saved time and voltage to {output_filename}")
+
+            # === Save to .txt (Voltage Only) ===
+            voltage_output_filename = os.path.join(
+                os.path.dirname(mat_file_path),
+                f"{os.path.splitext(os.path.basename(mat_file_path))[0]}_average10pA_voltage.txt"
+            )
+            np.savetxt(
+                voltage_output_filename,
+                mean_voltage,
+                fmt='%.6f',
+                header='Voltage (mV)',
+                comments='# '
+            )
+            print(f"Saved voltage only to {voltage_output_filename}")
+
+        except RuntimeError as e:
+            print(f"⚠️ Fit failed for {label}: {str(e)}")
+
+    # === Process Selected -10pA Pulses ===
+    params_list = []
+    plot_average_voltage_with_fit(selected_indices, '-10pA', params_list)
+
+    # === Save Parameters to .txt ===
+    params_filename = os.path.join(
+        os.path.dirname(mat_file_path),
+        f"{os.path.splitext(os.path.basename(mat_file_path))[0]}_parameters.txt"
+    )
+    if params_list:
+        dtype = [
+            ('Amplitude', 'U10'),
+            ('Baseline_Voltage_mV', float),
+            ('A_delta_V_mV', float),
+            ('Tau_s', float),
+            ('Input_Resistance_GOhm', float),
+            ('Capacitance_nF', float),
+            ('RMSE_mV', float),
+            ('R_squared', float)
+        ]
+        data_to_save = np.array([
+            (
+                params['Amplitude'],
+                params['Baseline_Voltage_mV'],
+                params['A_delta_V_mV'],
+                params['Tau_s'],
+                params['Input_Resistance_GOhm'],
+                params['Capacitance_nF'],
+                params['RMSE_mV'],
+                params['R_squared']
+            )
+            for params in params_list
+        ], dtype=dtype)
+        
+        with open(params_filename, 'w', encoding='utf-8') as f:
+            header = (
+                "Amplitude\tBaseline_Voltage_mV\tA_delta_V_mV\tTau_s\t"
+                "Input_Resistance_GOhm\tCapacitance_nF\tRMSE_mV\tR_squared"
+            )
+            f.write(f"# {header}\n")
+            for row in data_to_save:
+                f.write(
+                    f"{row['Amplitude']}\t{row['Baseline_Voltage_mV']:.6f}\t"
+                    f"{row['A_delta_V_mV']:.6f}\t{row['Tau_s']:.6f}\t"
+                    f"{row['Input_Resistance_GOhm']:.6f}\t{row['Capacitance_nF']:.6f}\t"
+                    f"{row['RMSE_mV']:.6f}\t{row['R_squared']:.6f}\n"
+                )
+        print(f"Saved parameters to {params_filename}")
+    else:
+        print("No parameters saved due to failed fits or no valid data.")
