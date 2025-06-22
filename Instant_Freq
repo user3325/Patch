@@ -1,0 +1,193 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy.io
+from scipy.signal import find_peaks
+from scipy.interpolate import interp1d
+import tkinter as tk
+from tkinter import filedialog
+import os
+
+# Set up Tkinter root window (hidden)
+root = tk.Tk()
+root.withdraw()
+
+# File dialog for multiple files
+file_paths = filedialog.askopenfilenames(title="Select .mat files", filetypes=[("MATLAB files", "*.mat")])
+if not file_paths:
+    print("❌ No files selected. Exiting.")
+    exit()
+
+# Create output folder in the directory of the first file
+output_dir = os.path.dirname(file_paths[0])
+freq_output_dir = os.path.join(output_dir, "Instantaneous_Frequencies")
+os.makedirs(freq_output_dir, exist_ok=True)
+
+# List to store frequency data for plotting
+all_freq_data = []
+
+# Process each file
+for file_path in file_paths:
+    base_filename = os.path.splitext(os.path.basename(file_path))[0]
+    print(f"\nProcessing file: {base_filename}")
+
+    # Load .mat file
+    try:
+        data = scipy.io.loadmat(file_path)
+    except Exception as e:
+        print(f"❌ Error loading file {base_filename}: {e}")
+        continue
+
+    # Detect voltage and current keys
+    voltage_key = next((k for k in data if "Voltage" in k), None)
+    current_key = next((k for k in data if "Current" in k), None)
+    if not voltage_key or not current_key:
+        print(f"❌ Voltage or Current data not found in {base_filename}!")
+        continue
+
+    # Extract data
+    voltage_data = data[voltage_key][0, 0]
+    current_data = data[current_key][0, 0]
+
+    voltage_time = np.arange(0, voltage_data['length'][0][0] * voltage_data['interval'][0][0],
+                             voltage_data['interval'][0][0])[:len(voltage_data['values'])]
+    current_time = np.arange(0, current_data['length'][0][0] * current_data['interval'][0][0],
+                             current_data['interval'][0][0])[:len(current_data['values'])]
+    voltage_values = voltage_data['values'].flatten()
+    current_values = current_data['values'].flatten()
+
+    # Print sampling interval
+    print(f"Sampling interval: {voltage_data['interval'][0][0]:.6f} s")
+
+    # Interpolate current to voltage time
+    try:
+        interp_func = interp1d(current_time, current_values, kind='linear', fill_value='extrapolate')
+        current_values_resampled = interp_func(voltage_time)
+    except Exception as e:
+        print(f"❌ Error interpolating current data in {base_filename}: {e}")
+        continue
+
+    # Detect current steps
+    baseline_current = np.mean(current_values[current_time < 10])
+    current_threshold = baseline_current + 2
+    steps = []
+    start_time = None
+    for i in range(1, len(current_values_resampled)):
+        if current_values_resampled[i] > current_threshold and current_values_resampled[i - 1] <= current_threshold:
+            start_time = voltage_time[i]
+        elif current_values_resampled[i] <= baseline_current and current_values_resampled[i - 1] > baseline_current and start_time is not None:
+            end_time = voltage_time[i]
+            if end_time - start_time >= 0.3:
+                amplitude = np.max(current_values_resampled[(voltage_time >= start_time) & (voltage_time <= end_time)]) - baseline_current
+                steps.append({'start_time': start_time, 'end_time': end_time, 'amplitude': amplitude})
+            start_time = None
+
+    # Find APs with adjusted sensitivity
+    ap_indices, _ = find_peaks(voltage_values, height=-10, prominence=0.5)
+    ap_times = voltage_time[ap_indices]
+
+    # Count APs for each step and store valid steps
+    valid_steps = []
+    for idx, step in enumerate(steps):
+        step_ap_indices = np.where((ap_times >= step['start_time']) & (ap_times <= step['end_time']))[0]
+        num_aps = len(step_ap_indices)
+        if num_aps > 0:  # Only include steps with at least one AP
+            valid_steps.append({
+                'index': idx,
+                'step': step,
+                'ap_indices': step_ap_indices,
+                'num_aps': num_aps
+            })
+
+    if not valid_steps:
+        print(f"❌ No steps with APs found in {base_filename}!")
+        continue
+
+    # Automatically select the step closest to 60 pA
+    target_amplitude = 60.0
+    selected_step_data = min(valid_steps, key=lambda x: abs(x['step']['amplitude'] - target_amplitude))
+    selected_step = selected_step_data['step']
+    selected_ap_indices = selected_step_data['ap_indices']
+    num_aps = selected_step_data['num_aps']
+    current_amplitude = selected_step['amplitude']
+
+    # Calculate instantaneous frequencies and filter > 500 Hz
+    selected_ap_times = ap_times[selected_ap_indices]
+    if len(selected_ap_times) > 1:
+        isis = np.diff(selected_ap_times)
+        inst_freqs = 1 / isis  # Instantaneous frequencies in Hz
+        freq_times = selected_ap_times[:-1] - selected_ap_times[0]  # Shift time to start at 0
+        # Filter frequencies <= 500 Hz
+        valid_mask = inst_freqs <= 500
+        inst_freqs = inst_freqs[valid_mask]
+        freq_times = freq_times[valid_mask]
+    else:
+        inst_freqs = np.array([])
+        freq_times = np.array([])
+        print(f"⚠ Warning: Not enough APs to calculate instantaneous frequencies in {base_filename}.")
+
+    # Export instantaneous frequencies to .txt
+    inst_freq_filename = f"{base_filename}_inst_freq.txt"
+    inst_freq_path = os.path.join(freq_output_dir, inst_freq_filename)
+    with open(inst_freq_path, 'w') as file:
+        file.write(f"Original Data File: {base_filename}\n")
+        file.write("Time (s)\tInstantaneous Frequency (Hz)\n")
+        for t, f in zip(freq_times, inst_freqs):
+            file.write(f"{t:.6f}\t{f:.2f}\n")
+    print(f"✅ Saved instantaneous frequencies to {inst_freq_filename}")
+
+    # Plot selected pulse with tighter time range
+    pulse_duration = selected_step['end_time'] - selected_step['start_time']
+    padding = 0.1 * pulse_duration  # 10% padding
+    x_min = selected_step['start_time'] - padding
+    x_max = selected_step['end_time'] + padding
+    pulse_mask = (voltage_time >= x_min) & (voltage_time <= x_max)
+    pulse_time = voltage_time[pulse_mask]
+    pulse_voltage = voltage_values[pulse_mask]
+    pulse_ap_times = ap_times[selected_ap_indices]
+    pulse_ap_voltages = voltage_values[ap_indices[selected_ap_indices]]
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(pulse_time, pulse_voltage, color='gray', label='Voltage Trace')
+    plt.scatter(pulse_ap_times, pulse_ap_voltages, color='red', s=50, label='Detected APs')
+    plt.axvspan(selected_step['start_time'], selected_step['end_time'], color='lightgreen', alpha=0.3, label='Current Step')
+    plt.xlim(x_min, x_max)
+    plt.xlabel('Time (s)')
+    plt.ylabel('Voltage (mV)')
+    plt.title(f"Selected 60pA Pulse: {base_filename} ({num_aps} APs, {current_amplitude:.2f} pA)")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # Store frequency data for plotting
+    if len(inst_freqs) > 0:
+        all_freq_data.append({
+            'filename': base_filename,
+            'freq_times': freq_times,
+            'inst_freqs': inst_freqs,
+            'num_aps': num_aps,
+            'current_amplitude': current_amplitude
+        })
+
+    # Print number of APs and current amplitude
+    print(f"\n--- Results for {base_filename} ---")
+    print(f"Selected Pulse: Closest to 60 pA (Actual: {current_amplitude:.2f} pA)")
+    print(f"Number of APs in Selected Step: {num_aps}")
+    print(f"Current Amplitude: {current_amplitude:.2f} pA")
+
+# Plot overlapped instantaneous frequencies
+if all_freq_data:
+    plt.figure(figsize=(12, 6))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(all_freq_data)))  # Unique colors
+    for i, data in enumerate(all_freq_data):
+        plt.plot(data['freq_times'], data['inst_freqs'], 'o-', color=colors[i],
+                 label=f"{data['filename']} ({data['num_aps']} APs, {data['current_amplitude']:.2f} pA)",
+                 markersize=4, linewidth=1.5, alpha=0.7)
+    plt.xlabel('Time (s, relative to first AP)')
+    plt.ylabel('Instantaneous Frequency (Hz)')
+    plt.title('Instantaneous Frequencies for 60pA Pulses')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+else:
+    print("⚠ No plots generated due to insufficient valid data across all files.")
