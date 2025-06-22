@@ -1,0 +1,472 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy.io
+from scipy.signal import find_peaks
+from scipy.interpolate import interp1d
+import tkinter as tk
+from tkinter import filedialog
+import os
+
+# Set up the Tkinter root window (it will be hidden)
+root = tk.Tk()
+root.withdraw()
+
+# Open file dialog for multiple files
+file_paths = filedialog.askopenfilenames(title="Select .mat files",
+                                        filetypes=[("MATLAB files", "*.mat")])
+if not file_paths:
+    print("\u2705 No files selected. Exiting.")
+    exit()
+
+# List to store results for each file
+all_results = []
+
+# Define parameter names for TSV headers (with units)
+param_headers = [
+    "File_Name",
+    "Current_Amplitude_(pA)",
+    "Baseline_Voltage_(mV)",
+    "Peak_Voltage_(mV)",
+    "Half_Max_Voltage_(mV)",
+    "AP_Width_(ms)",
+    "Threshold_Voltage_(mV)",
+    "AP_Amplitude_(mV)",
+    "AHP_Voltage_(mV)",
+    "AHP_Amplitude_(mV)",
+    "AHP_Delay_(ms)",
+    "Max_Depolarization_Rate_(mV/s)",
+    "Max_Repolarization_Rate_(mV/s)",
+    "AP_Frequency_(Hz)"
+]
+
+# Initialize results TSV file
+output_dir = os.path.dirname(file_paths[0]) if file_paths else "."
+subfolder = "First AP Waveform"
+output_subfolder = os.path.join(output_dir, subfolder)
+os.makedirs(output_subfolder, exist_ok=True)
+results_filename = os.path.join(output_subfolder, "results.txt")
+write_headers = not os.path.exists(results_filename)  # Write headers only if file doesn't exist
+
+# Process each file
+for file_path in file_paths:
+    base_filename = os.path.splitext(os.path.basename(file_path))[0]
+    print(f"\nProcessing file: {base_filename}")
+    
+    # Load MATLAB file
+    try:
+        data = scipy.io.loadmat(file_path)
+    except Exception as e:
+        print(f"\u2705 Error loading file {base_filename}: {e}")
+        continue
+
+    # Find voltage and current channel keys
+    voltage_key = next((key for key in data.keys() if "Voltage" in key), None)
+    current_key = next((key for key in data.keys() if "Current" in key), None)
+    if not voltage_key or not current_key:
+        print(f"\u2705 Voltage or Current data not found in {base_filename}!")
+        continue
+
+    # Extract data
+    voltage_data = data[voltage_key][0, 0]
+    current_data = data[current_key][0, 0]
+
+    voltage_time = np.arange(0, voltage_data['length'][0][0] *
+                            voltage_data['interval'][0][0],
+                            voltage_data['interval'][0][0])[:len(voltage_data['values'])]
+    current_time = np.arange(0, current_data['length'][0][0] *
+                            current_data['interval'][0][0],
+                            current_data['interval'][0][0])[:len(current_data['values'])]
+    voltage_values = voltage_data['values'].flatten()
+    current_values = current_data['values'].flatten()
+
+    # Validate sampling interval (20 kHz = 0.00005 s)
+    sampling_interval = 0.00005  # Enforce 20 kHz
+    if abs(voltage_data['interval'][0][0] - sampling_interval) > 1e-10:
+        print(f"\u26A0 Warning: File {base_filename} has sampling interval "
+              f"{voltage_data['interval'][0][0]:.6f} s, expected {sampling_interval} s (20 kHz). Using 0.00005 s.")
+
+    # Interpolate current to voltage time axis
+    interp_func = interp1d(current_time, current_values, kind='linear',
+                          fill_value='extrapolate')
+    current_values_resampled = interp_func(voltage_time)
+
+    # Detect current steps
+    baseline_current = np.mean(current_values[current_time < 10])
+    current_threshold = baseline_current + 2
+    steps = []
+    start_time = None
+    for i in range(1, len(current_values_resampled)):
+        if current_values_resampled[i] > current_threshold and current_values_resampled[i - 1] <= current_threshold:
+            start_time = voltage_time[i]
+        if current_values_resampled[i] <= baseline_current and current_values_resampled[i - 1] > baseline_current and start_time is not None:
+            end_time = voltage_time[i]
+            if end_time - start_time >= 0.3:
+                amplitude = np.max(current_values_resampled[(voltage_time >= start_time) & (voltage_time <= end_time)]) - baseline_current
+                steps.append({'start_time': start_time, 'end_time': end_time, 'amplitude': amplitude})
+            start_time = None
+
+    # Find action potentials
+    ap_indices, _ = find_peaks(voltage_values, height=-20, prominence=1)
+    ap_times = voltage_time[ap_indices]
+
+    # Identify the first current step with 18–32 APs
+    selected_step = None
+    selected_ap_count = 0
+    for step in steps:
+        step_ap_indices = np.where((ap_times >= step['start_time']) & (ap_times <= step['end_time']))[0]
+        if 18 <= len(step_ap_indices) <= 32:
+            selected_step = step
+            selected_ap_count = len(step_ap_indices)
+            break
+
+    if not selected_step:
+        print(f"\u2705 No current step with 18–32 APs found in {base_filename}!")
+        continue
+
+    # Plot full trace and selected pulse side by side
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5), sharey=True)
+    
+    # Left subplot: Full trace
+    ax1.plot(voltage_time, voltage_values, color='gray', label='Voltage Trace')
+    ax1.scatter(ap_times, voltage_values[ap_indices], color='red', s=30, label='Detected APs')
+    ax1.axvspan(selected_step['start_time'], selected_step['end_time'], color='lightgreen', alpha=0.3, label='Selected Pulse')
+    # Select only the first AP
+    if len(step_ap_indices) > 0:
+        first_ap_index = step_ap_indices[0]
+        selected_ap_indices = ap_indices[[first_ap_index]]
+        selected_ap_times = ap_times[[first_ap_index]]
+        ax1.scatter(selected_ap_times, voltage_values[selected_ap_indices], color='blue', marker='*', s=50, label='First AP for Analysis')
+        # Add AP number label (1)
+        ax1.text(selected_ap_times[0] + 0.01, voltage_values[selected_ap_indices[0]] + 5, "1", fontsize=8, color='blue')
+    ax1.set_xlabel('Time (s)')
+    ax1.set_ylabel('Voltage (mV)')
+    ax1.set_title('Full Trace')
+    ax1.legend()
+    ax1.grid(True)
+
+    # Right subplot: Zoomed selected pulse
+    pulse_duration = selected_step['end_time'] - selected_step['start_time']
+    padding = 0.1 * pulse_duration  # 10% padding
+    x_min = selected_step['start_time'] - padding
+    x_max = selected_step['end_time'] + padding
+    pulse_mask = (voltage_time >= x_min) & (voltage_time <= x_max)
+    ax2.plot(voltage_time[pulse_mask], voltage_values[pulse_mask], color='gray', label='Voltage Trace')
+    pulse_ap_mask = (ap_times >= x_min) & (ap_times <= x_max)
+    ax2.scatter(ap_times[pulse_ap_mask], voltage_values[ap_indices][pulse_ap_mask], color='red', s=30, label='Detected APs')
+    ax2.axvspan(selected_step['start_time'], selected_step['end_time'], color='lightgreen', alpha=0.3, label='Selected Pulse')
+    if len(step_ap_indices) > 0:
+        selected_ap_mask = (selected_ap_times >= x_min) & (selected_ap_times <= x_max)
+        ax2.scatter(selected_ap_times[selected_ap_mask], voltage_values[selected_ap_indices][selected_ap_mask], color='blue', marker='*', s=50, label='First AP for Analysis')
+        # Add AP number label (1)
+        ax2.text(selected_ap_times[0] + 0.01, voltage_values[selected_ap_indices[0]] + 5, "1", fontsize=8, color='blue')
+    ax2.set_xlabel('Time (s)')
+    ax2.set_title('Selected Pulse (Zoomed)')
+    ax2.set_xlim(x_min, x_max)
+    ax2.legend()
+    ax2.grid(True)
+
+    fig.suptitle(f"Selected Pulse for Analysis - {base_filename} ({selected_ap_count} APs)")
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.show()
+
+    # Calculate frequency of APs in the selected step
+    step_duration = selected_step['end_time'] - selected_step['start_time']
+    ap_frequency = selected_ap_count / step_duration  # Hz
+
+    # Extract the first AP waveform
+    if len(step_ap_indices) == 0:
+        print(f"\u2705 No APs found in selected step for {base_filename}!")
+        continue
+    selected_ap_indices_global = ap_indices[[step_ap_indices[0]]]
+    selected_ap_times = ap_times[[step_ap_indices[0]]]
+
+    # Extract AP waveforms, aligning peaks
+    pre_window = 0.004  # 4 ms before peak
+    post_window = 0.010  # 10 ms after peak
+    expected_points = int((pre_window + post_window) / sampling_interval) + 1  # 281 points
+    ap_traces = []
+    ap_times = []
+    debug_traces = []
+    for t in selected_ap_times:
+        try:
+            # Find peak within search window
+            idx = np.where(voltage_time >= t - pre_window)[0][0]
+            search_end_idx = np.where(voltage_time <= t + post_window)[0][-1]
+            peak_idx = np.argmax(voltage_values[idx:search_end_idx + 1]) + idx
+            peak_time = voltage_time[peak_idx]
+            # Calculate indices for exactly 281 points
+            points_before = int(pre_window / sampling_interval)  # 80 points
+            points_after = int(post_window / sampling_interval)  # 200 points
+            start_idx = peak_idx - points_before
+            end_idx = peak_idx + points_after
+            # Ensure indices are within bounds
+            start_idx = max(0, start_idx)
+            end_idx = min(len(voltage_values) - 1, end_idx)
+            trace = voltage_values[start_idx:end_idx + 1]
+            trace_time = voltage_time[start_idx:end_idx + 1]
+            # Verify point count
+            if len(trace) != expected_points:
+                print(f"\u26A0 Warning: Trace has {len(trace)} points, expected {expected_points} in {base_filename}")
+                print(f"  Actual window: {trace_time[0]:.6f} s to {trace_time[-1]:.6f} s")
+                # Adjust if possible
+                if len(trace) < expected_points:
+                    # Extend end_idx if possible
+                    points_needed = expected_points - len(trace)
+                    end_idx = min(len(voltage_values) - 1, end_idx + points_needed)
+                    trace = voltage_values[start_idx:end_idx + 1]
+                    trace_time = voltage_time[start_idx:end_idx + 1]
+                elif len(trace) > expected_points:
+                    # Trim to expected_points
+                    trace = trace[:expected_points]
+                    trace_time = trace_time[:expected_points]
+            ap_traces.append(trace)
+            ap_times.append(trace_time)
+            debug_traces.append((t, len(trace), start_idx, end_idx, peak_idx - start_idx))
+        except (IndexError, ValueError) as e:
+            debug_traces.append((t, 0, None, None, None))
+            print(f"\u26A0 Warning: Failed to extract trace for t={t:.4f} in {base_filename}: {e}")
+            continue
+    if not ap_traces:
+        print(f"\u2705 No valid AP traces extracted in {base_filename}!")
+        print(f"Debug: Attempted {len(selected_ap_times)} traces: {[(t, l, s, e, p) for t, l, s, e, p in debug_traces]}")
+        continue
+
+    mean_ap = ap_traces[0]  # First AP, no averaging
+    ap_time = ap_times[0]   # Original time points
+
+    # Save AP trace data to .txt file (no SD)
+    ap_trace_filename = os.path.join(output_subfolder, f"{base_filename}_AP_trace.txt")
+    with open(ap_trace_filename, 'w') as f:
+        f.write("Time_(s)\tVoltage_(mV)\n")
+        for t, m in zip(ap_time, mean_ap):
+            f.write(f"{t:.6f}\t{m:.2f}\n")
+    print(f"\u2705 Saved AP trace data to {ap_trace_filename}")
+
+    # Calculate dV/dt for phase plot and parameters
+    dv_dt = np.gradient(mean_ap, sampling_interval * 1000)  # mV/s, using fixed 0.00005 s
+    mean_dv_dt = dv_dt
+
+    # Save phase plot data to .txt file (no SD)
+    phase_plot_filename = os.path.join(output_subfolder, f"{base_filename}_phase_plot.txt")
+    with open(phase_plot_filename, 'w') as f:
+        f.write("Voltage_(mV)\tMean_dV/dt_(mV/s)\n")
+        for v, m in zip(mean_ap, mean_dv_dt):
+            f.write(f"{v:.2f}\t{m:.2f}\n")
+    print(f"\u2705 Saved phase plot data to {phase_plot_filename}")
+
+    # Calculate baseline voltage
+    baseline_voltage = np.nanmean(mean_ap[(ap_time >= ap_time[0]) & (ap_time <= ap_time[0] + 0.002)])
+
+    # Calculate peak voltage and half-max voltage
+    peak_voltage = np.nanmax(mean_ap)
+    half_max_voltage = baseline_voltage + (peak_voltage - baseline_voltage) / 2
+    
+    # Calculate AP amplitude (peak voltage - threshold voltage)
+    ap_amplitude = None  # Placeholder, calculated after threshold
+
+    # Find half-max crossings
+    try:
+        upstroke_idx = np.where(mean_ap >= half_max_voltage)[0][0]
+        downstroke_idx = np.where(mean_ap[upstroke_idx:] < half_max_voltage)[0][0] + upstroke_idx
+        t1, t2 = ap_time[upstroke_idx], ap_time[downstroke_idx]
+        width = (t2 - t1) * 1000  # Convert to ms
+    except IndexError:
+        print(f"\u2705 Failed to find half-max crossings in {base_filename}!")
+        continue
+
+    # Calculate threshold and amplitude
+    valid_dv_dt = dv_dt[~np.isnan(dv_dt)]
+    if len(valid_dv_dt) == 0:
+        print(f"\u26A0 Warning: No valid dV/dt values in {base_filename}")
+        continue
+    threshold_idx = np.where(dv_dt > 10)[0][0]
+    threshold_voltage = mean_ap[threshold_idx]
+    ap_amplitude = peak_voltage - threshold_voltage
+
+    # Calculate maximum depolarization and repolarization rates
+    max_depol_rate = np.nanmax(dv_dt)
+    max_repol_rate = np.nanmin(dv_dt)
+
+    # Validate max_depol_rate
+    valid_mask = ~np.isnan(mean_ap) & ~np.isnan(mean_dv_dt)
+    max_dv_dt_plot = np.max(mean_dv_dt[valid_mask]) if np.any(valid_mask) else np.nan
+    if abs(max_depol_rate - max_dv_dt_plot) > 1e-5:
+        print(f"\u26A0 Warning: max_depol_rate ({max_depol_rate:.2f} mV/s) does not match "
+              f"max dV/dt in plot ({max_dv_dt_plot:.2f} mV/s) in {base_filename}")
+
+    # Calculate AHP (lowest voltage after peak) and AHP amplitude
+    peak_time = ap_time[np.argmax(mean_ap)]
+    ahp_search_start = peak_time + 0.0005  # Start searching 0.5 ms after peak
+    ahp_search_end = peak_time + 0.010  # Search up to 10 ms after peak
+    ahp_indices = (ap_time > ahp_search_start) & (ap_time <= ahp_search_end)
+    if np.any(ahp_indices):
+        AHP_voltage = np.min(mean_ap[ahp_indices])
+        AHP_time = ap_time[ahp_indices][np.argmin(mean_ap[ahp_indices])]
+        AHP_delay = (AHP_time - peak_time) * 1000  # Convert to ms
+        # Validate AHP: delay >= 0.1 ms and AHP voltage < baseline - 5 mV
+        if AHP_delay < 0.1 or AHP_voltage >= baseline_voltage - 5:
+            print(f"\u26A0 Warning: Invalid AHP in {base_filename}: "
+                  f"AHP_delay={AHP_delay:.4f} ms, AHP_voltage={AHP_voltage:.2f} mV, "
+                  f"baseline_voltage={baseline_voltage:.2f} mV, peak_time={peak_time:.4f} s, "
+                  f"AHP_time={AHP_time:.4f} s, window_size={np.sum(ahp_indices)} points")
+            AHP_voltage = np.nan
+            AHP_delay = np.nan
+    else:
+        print(f"\u26A0 Warning: No AHP found in window {ahp_search_start:.4f} s to "
+              f"{ahp_search_end:.4f} s in {base_filename}. Setting AHP parameters to NaN.")
+        AHP_voltage = np.nan
+        AHP_delay = np.nan
+    AHP_amplitude = threshold_voltage - AHP_voltage if not np.isnan(AHP_voltage) else np.nan
+
+    # Store results
+    results = {
+        'file': base_filename,
+        'current_amplitude': selected_step['amplitude'],
+        'baseline_voltage': baseline_voltage,
+        'peak_voltage': peak_voltage,
+        'half_max_voltage': half_max_voltage,
+        'ap_width': width,
+        'threshold_voltage': threshold_voltage,
+        'ap_amplitude': ap_amplitude,
+        'ahp_voltage': AHP_voltage,
+        'ahp_amplitude': AHP_amplitude,
+        'ahp_delay': AHP_delay,
+        'max_depol_rate': max_depol_rate,
+        'max_repol_rate': max_repol_rate,
+        'ap_frequency': ap_frequency
+    }
+    all_results.append(results)
+
+    # Save results to TSV file
+    with open(results_filename, 'a' if not write_headers else 'w') as f:
+        if write_headers:
+            f.write("\t".join(param_headers) + "\n")
+            write_headers = False
+        values = [
+            base_filename,
+            f"{selected_step['amplitude']:.2f}",
+            f"{baseline_voltage:.2f}",
+            f"{peak_voltage:.2f}",
+            f"{half_max_voltage:.2f}",
+            f"{width:.2f}",
+            f"{threshold_voltage:.2f}",
+            f"{ap_amplitude:.2f}",
+            f"{AHP_voltage:.2f}" if not np.isnan(AHP_voltage) else "NaN",
+            f"{AHP_amplitude:.2f}" if not np.isnan(AHP_amplitude) else "NaN",
+            f"{AHP_delay:.2f}" if not np.isnan(AHP_delay) else "NaN",
+            f"{max_depol_rate:.2f}",
+            f"{max_repol_rate:.2f}",
+            f"{ap_frequency:.2f}"
+        ]
+        f.write("\t".join(values) + "\n")
+    print(f"\u2705 Saved results to {results_filename}")
+
+    # Print results for this file
+    print(f"\n--- First AP Parameters for {base_filename} ---")
+    print(f"Current Amplitude: {selected_step['amplitude']:.2f} pA")
+    print(f"Baseline Voltage: {baseline_voltage:.2f} mV")
+    print(f"Peak Voltage: {peak_voltage:.2f} mV")
+    print(f"Half-Max Voltage: {half_max_voltage:.2f} mV")
+    print(f"AP Width: {width:.2f} ms")
+    print(f"Threshold Voltage: {threshold_voltage:.2f} mV")
+    print(f"AP Amplitude: {ap_amplitude:.2f} mV")
+    print(f"AHP Voltage: {AHP_voltage:.2f} mV" if not np.isnan(AHP_voltage) else "AHP Voltage: NaN")
+    print(f"AHP Amplitude: {AHP_amplitude:.2f} mV" if not np.isnan(AHP_amplitude) else "AHP Amplitude: NaN")
+    print(f"AHP Delay: {AHP_delay:.2f} ms" if not np.isnan(AHP_delay) else "AHP Delay: NaN")
+    print(f"Max Depolarization Rate: {max_depol_rate:.2f} mV/s")
+    print(f"Max Repolarization Rate: {max_repol_rate:.2f} mV/s")
+    print(f"AP Frequency in Selected Step: {ap_frequency:.2f} Hz")
+
+    # Plot mean AP with cursors (display only, no SD)
+    plt.figure(figsize=(10, 5))
+    plt.plot(ap_time, mean_ap, label='First AP', color='b')
+    plt.axhline(y=baseline_voltage, color='lightgreen', linestyle='-', linewidth=5, alpha=0.5, label='Baseline Range')
+    plt.axhline(y=peak_voltage, color='black', linestyle='--', label='Peak Voltage')
+    plt.axhline(y=half_max_voltage, color='red', linestyle='--', label='Half-Max Voltage')
+    plt.axvline(t1, color='purple', linestyle='--', label='Upstroke Crossing')
+    plt.axvline(t2, color='green', linestyle='--', label='Downstroke Crossing')
+    plt.axhline(y=threshold_voltage, color='orange', linestyle='--', label='Threshold Voltage')
+    if not np.isnan(AHP_voltage):
+        plt.axhline(y=AHP_voltage, color='darkblue', linestyle='--', label='AHP Voltage')
+    plt.axvline(ap_time[np.argmax(mean_ap)], color='cyan', linestyle='--', label='AP Peak Time')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Voltage (mV)')
+    plt.legend()
+    plt.title(f"First AP with Cursors - {base_filename}")
+    plt.grid(True)
+    plt.show()
+
+    # Phase plot with adaptable scaling (display only)
+    plt.figure(figsize=(8, 6))
+    # Filter NaNs for plotting
+    valid_mask = ~np.isnan(mean_ap) & ~np.isnan(mean_dv_dt)
+    plt.plot(mean_ap[valid_mask], mean_dv_dt[valid_mask], label='First AP Phase Plot', color='r')
+    # Add cursors
+    plt.axhline(y=10, color='gray', linestyle='--', label='Threshold = 10 mV/s')
+    plt.axhline(y=max_depol_rate, color='green', linestyle='--', label='Max Depolarization Rate')
+    plt.axhline(y=max_repol_rate, color='purple', linestyle='--', label='Max Repolarization Rate')
+    # Set adaptable axis limits with increased padding
+    x_data = mean_ap[valid_mask]
+    y_data = mean_dv_dt[valid_mask]
+    if len(x_data) == 0 or len(y_data) == 0:
+        print(f"\u26A0 Warning: No valid data for phase plot in {base_filename}")
+        continue
+    x_min, x_max = np.min(x_data), np.max(x_data)
+    y_min, y_max = np.min(y_data), np.max(y_data)
+    # Include cursors in y-axis range
+    y_cursors = [10, max_depol_rate, max_repol_rate]
+    valid_cursors = [y for y in y_cursors if not np.isnan(y)]
+    if valid_cursors:
+        y_min = min(y_min, np.min(valid_cursors))
+        y_max = max(y_max, np.max(valid_cursors))
+    # Add 10% padding for x-axis, 15% for y-axis
+    x_range = x_max - x_min if x_max != x_min else 1
+    y_range = y_max - y_min if y_max != y_min else 1
+    x_pad = 0.1 * x_range
+    y_pad = 0.15 * y_range
+    plt.xlim(x_min - x_pad, x_max + x_pad)
+    plt.ylim(y_min - y_pad, y_max + y_pad)
+    # Add margins as fallback
+    plt.margins(0.1)
+    # Debug output
+    print(f"Phase plot ranges for {base_filename}:")
+    print(f"  Voltage (mV): [{x_min:.2f}, {x_max:.2f}] -> [{x_min - x_pad:.2f}, {x_max + x_pad:.2f}]")
+    print(f"  dV/dt (mV/s): [{np.min(y_data):.2f}, {np.max(y_data):.2f}] -> [{y_min - y_pad:.2f}, {y_max + y_pad:.2f}]")
+    print(f"  Cursors (mV/s): {y_cursors}")
+    print(f"  Max dV/dt in plot: {np.max(y_data):.2f} mV/s, Reported max_depol_rate: {max_depol_rate:.2f} mV/s")
+    print(f"  Data points: {len(x_data)} (expected {expected_points})")
+    plt.xlabel('Voltage (mV)')
+    plt.ylabel('dV/dt (mV/s)')
+    plt.legend()
+    plt.title(f"Phase Plot - {base_filename}")
+    plt.grid(True)
+    plt.show()
+
+# Print summary statistics if multiple files were processed
+if len(all_results) > 1:
+    print("\n--- Summary Statistics Across Files ---")
+    param_keys = ['current_amplitude', 'baseline_voltage', 'peak_voltage', 'half_max_voltage', 'ap_width',
+                  'threshold_voltage', 'ap_amplitude', 'ahp_voltage', 'ahp_amplitude',
+                  'ahp_delay', 'max_depol_rate', 'max_repol_rate', 'ap_frequency']
+    param_names = ['Current Amplitude (pA)', 'Baseline Voltage (mV)', 'Peak Voltage (mV)', 'Half-Max Voltage (mV)',
+                   'AP Width (ms)', 'Threshold Voltage (mV)', 'AP Amplitude (mV)',
+                   'AHP Voltage (mV)', 'AHP Amplitude (mV)', 'AHP Delay (ms)',
+                   'Max Depolarization Rate (mV/s)', 'Max Repolarization Rate (mV/s)',
+                   'AP Frequency (Hz)']
+    
+    print("\n{:<30} {:>10} {:>10}".format("Parameter", "Mean", "SD"))
+    print("-" * 52)
+    for key, name in zip(param_keys, param_names):
+        values = [result[key] for result in all_results if not np.isnan(result[key])]
+        if values:
+            mean_val = np.mean(values)
+            sd_val = np.std(values)
+            print(f"{name:<30} {mean_val:>10.2f} {sd_val:>10.2f}")
+        else:
+            print(f"{name:<30} {'NaN':>10} {'NaN':>10}")
+elif len(all_results) == 1:
+    print("\n--- Summary ---")
+    print(f"Only one file processed: {all_results[0]['file']}")
+else:
+    print("\n--- Summary ---")
+    print("No valid files were processed.")
