@@ -1,0 +1,318 @@
+# import numpy as np
+import matplotlib.pyplot as plt
+import scipy.io
+from scipy.signal import find_peaks
+from scipy.interpolate import interp1d
+import os
+import re
+import tkinter as tk
+from tkinter import filedialog
+
+# Function to extract temperature from filename
+def extract_temperature(filename):
+    basename = os.path.basename(filename).replace('.mat', '')
+    temp_match = re.search(r"(\d+)([cC]|#\d)", basename)
+    if temp_match:
+        temp = temp_match.group(1)
+        suffix = temp_match.group(2)
+        return f"{temp}C" if suffix.lower() == 'c' else f"{temp}{suffix}"
+    return "UnknownTemp"
+
+# Console-based function to select pulses for processing
+def select_pulses_for_inclusion(steps, voltage_time, voltage_values, base_filename, valid_ap_times):
+    print(f"\n=== Select Pulses to Process for {base_filename} ===")
+    print("Pulses with < 6 APs (may lack overshoot > -10 mV) are marked with ⚠️.")
+    print("Enter pulse numbers to process (e.g., '1,2,4' or 'all' for all pulses).")
+    print("Available pulses:")
+    
+    # Display pulses
+    for i, step in enumerate(steps, 1):
+        step_ap_indices = np.where((valid_ap_times >= step['start_time']) & (valid_ap_times <= step['end_time']))[0]
+        ap_count = len(step_ap_indices)
+        label = f"  Pulse {i}: {step['amplitude']:.1f} pA ({ap_count} APs)"
+        if ap_count < 6:
+            label += " ⚠️"
+        print(label)
+    
+    # Get user input
+    while True:
+        user_input = input("Enter pulse numbers or 'all': ").strip().lower()
+        if user_input == 'all':
+            print("Selected all pulses for processing.")
+            return steps
+        try:
+            selections = [int(x) - 1 for x in user_input.split(',') if x.strip()]
+            if all(0 <= x < len(steps) for x in selections):
+                included_pulses = [steps[i] for i in selections]
+                if included_pulses:
+                    print(f"Selected pulses: {[i + 1 for i in selections]}")
+                    return included_pulses
+                else:
+                    print("❌ No valid pulses selected. Please select at least one pulse.")
+            else:
+                print(f"❌ Invalid pulse numbers. Please enter numbers between 1 and {len(steps)}.")
+        except ValueError:
+            print("❌ Invalid input. Please enter numbers separated by commas (e.g., '1,2') or 'all'.")
+
+# Console-based function to select pulses for saving to .txt file
+def select_pulses_for_saving(file_freq_data, base_filename, valid_ap_times):
+    print(f"\n=== Select Pulses to Save to .txt for {base_filename} ===")
+    print("Select pulses to include in the frequency data file.")
+    print("Enter pulse numbers to save (e.g., '1,2,4' or 'all' for all pulses).")
+    print("Processed pulses:")
+    
+    # Display pulses with frequency data
+    for i, data in enumerate(file_freq_data, 1):
+        step_ap_indices = np.where((valid_ap_times >= data['step']['start_time']) & 
+                                  (valid_ap_times <= data['step']['end_time']))[0]
+        ap_count = len(step_ap_indices)
+        freq_first = data['freq_first']
+        freq_last = data['freq_last']
+        label = (f"  Pulse {i}: {data['current_amplitude']:.1f} pA, {ap_count} APs, "
+                 f"First: {freq_first:.1f} Hz, Last: {freq_last:.1f} Hz")
+        print(label)
+    
+    # Get user input
+    while True:
+        user_input = input("Enter pulse numbers or 'all': ").strip().lower()
+        if user_input == 'all':
+            print("Selected all pulses for saving.")
+            return file_freq_data
+        try:
+            selections = [int(x) - 1 for x in user_input.split(',') if x.strip()]
+            if all(0 <= x < len(file_freq_data) for x in selections):
+                saved_pulses = [file_freq_data[i] for i in selections]
+                if saved_pulses:
+                    print(f"Selected pulses for saving: {[i + 1 for i in selections]}")
+                    return saved_pulses
+                else:
+                    print("❌ No valid pulses selected. Please select at least one pulse.")
+            else:
+                print(f"❌ Invalid pulse numbers. Please enter numbers between 1 and {len(file_freq_data)}.")
+        except ValueError:
+            print("❌ Invalid input. Please enter numbers separated by commas (e.g., '1,2') or 'all'.")
+
+# Tkinter file selection with error handling
+try:
+    root = tk.Tk()
+    root.withdraw()
+    file_paths = filedialog.askopenfilenames(
+        title="Select one or more .mat files",
+        filetypes=[("MATLAB files", "*.mat")]
+    )
+    root.destroy()
+except Exception as e:
+    print(f"❌ Error in file selection dialog: {e}. Exiting.")
+    exit()
+
+if not file_paths:
+    print("❌ No files selected. Exiting.")
+    exit()
+
+# Process each file
+for file_path in file_paths:
+    # Get base filename and temperature
+    base_filename = os.path.splitext(os.path.basename(file_path))[0]
+    temperature = extract_temperature(file_path)
+    safe_temp = temperature.replace('#', '_')
+    
+    # Initialize frequency data for this file
+    file_freq_data = []
+
+    # Get output directory
+    output_dir = os.path.dirname(file_path)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # Load .mat file
+    try:
+        data = scipy.io.loadmat(file_path)
+    except Exception as e:
+        print(f"❌ Error loading {file_path}: {e}")
+        continue
+
+    # Detect voltage and current keys
+    voltage_key = next((k for k in data if "Voltage" in k), None)
+    current_key = next((k for k in data if "Current" in k), None)
+    if not voltage_key or not current_key:
+        print(f"❌ Voltage or Current data not found in {base_filename}!")
+        continue
+
+    # Extract data
+    voltage_data = data[voltage_key][0, 0]
+    current_data = data[current_key][0, 0]
+
+    voltage_time = np.arange(0, voltage_data['length'][0][0] * voltage_data['interval'][0][0], 
+                            voltage_data['interval'][0][0])[:len(voltage_data['values'])]
+    current_time = np.arange(0, current_data['length'][0][0] * current_data['interval'][0][0], 
+                            current_data['interval'][0][0])[:len(current_data['values'])]
+    voltage_values = voltage_data['values'].flatten()
+    current_values = current_data['values'].flatten()
+
+    # Interpolate current to voltage time
+    try:
+        interp_func = interp1d(current_time, current_values, kind='linear', fill_value='extrapolate')
+        current_values_resampled = interp_func(voltage_time)
+    except Exception as e:
+        print(f"❌ Error interpolating current in {file_path}: {e}")
+        continue
+
+    # Detect steps
+    baseline_current = np.mean(current_values[current_time < 10])
+    current_threshold = baseline_current + 2
+    steps = []
+    start_time = None
+    for i in range(1, len(current_values_resampled)):
+        if current_values_resampled[i] > current_threshold and current_values_resampled[i - 1] <= current_threshold:
+            start_time = voltage_time[i]
+        if current_values_resampled[i] <= baseline_current and current_values_resampled[i - 1] > baseline_current and start_time is not None:
+            end_time = voltage_time[i]
+            if end_time - start_time >= 0.3:
+                amplitude = np.max(current_values_resampled[(voltage_time >= start_time) & (voltage_time <= end_time)]) - baseline_current
+                steps.append({'start_time': start_time, 'end_time': end_time, 'amplitude': amplitude})
+            start_time = None
+
+    # Find APs with peak voltage > -10 mV
+    peak_indices, _ = find_peaks(voltage_values, prominence=0.5, distance=int(0.002 / voltage_data['interval'][0][0]))
+    valid_ap_indices = []
+    valid_ap_times = []
+    
+    for idx in peak_indices:
+        peak_voltage = voltage_values[idx]
+        if peak_voltage > -10:
+            valid_ap_indices.append(idx)
+            valid_ap_times.append(voltage_time[idx])
+
+    valid_ap_indices = np.array(valid_ap_indices)
+    valid_ap_times = np.array(valid_ap_times)
+
+    # Allow user to select pulses to process
+    if steps:
+        included_steps = select_pulses_for_inclusion(steps, voltage_time, voltage_values, base_filename, valid_ap_times)
+        if not included_steps:
+            print(f"⚠️ No pulses selected for processing in {base_filename}, skipping.")
+            continue
+    else:
+        print(f"⚠️ No valid steps found for {base_filename}, skipping processing.")
+        continue
+
+    # Process each included step
+    for pulse_idx, step in enumerate(included_steps, 1):
+        step_ap_indices = np.where((valid_ap_times >= step['start_time']) & (valid_ap_times <= step['end_time']))[0]
+        if len(step_ap_indices) >= 6:
+            pulse_ap_times = valid_ap_times[step_ap_indices]
+            
+            isis = np.diff(pulse_ap_times) * 1000
+            if len(isis) >= 3:
+                mean_isi_first = np.mean(isis[:3])
+                mean_isi_last = np.mean(isis[-3:])
+                
+                freq_first = 1000 / mean_isi_first if mean_isi_first != 0 else np.nan
+                freq_last = 1000 / mean_isi_last if mean_isi_last != 0 else np.nan
+                
+                current_rounded = 5 * round(step['amplitude'] / 5)
+
+                file_freq_data.append({
+                    'current_amplitude': current_rounded,
+                    'freq_first': freq_first,
+                    'freq_last': freq_last,
+                    'step': step
+                })
+
+                plt.figure(figsize=(10, 6))
+                plt.plot(voltage_time[(voltage_time >= step['start_time']) & (voltage_time <= step['end_time'])], 
+                         voltage_values[(voltage_time >= step['start_time']) & (voltage_time <= step['end_time'])], 
+                         label="Voltage Trace")
+                if len(pulse_ap_times) >= 6:
+                    plt.axvline(x=pulse_ap_times[0], color='blue', linestyle='--', label="First 3 ISIs")
+                    plt.axvline(x=pulse_ap_times[1], color='blue', linestyle='--')
+                    plt.axvline(x=pulse_ap_times[2], color='blue', linestyle='--')
+                    plt.axvline(x=pulse_ap_times[3], color='blue', linestyle='--')
+                    plt.axvline(x=pulse_ap_times[-4], color='red', linestyle='--', label="Last 3 ISIs")
+                    plt.axvline(x=pulse_ap_times[-3], color='red', linestyle='--')
+                    plt.axvline(x=pulse_ap_times[-2], color='red', linestyle='--')
+                    plt.axvline(x=pulse_ap_times[-1], color='red', linestyle='--')
+                plt.xlabel("Time (s)")
+                plt.ylabel("Voltage (mV)")
+                plt.title(f"Pulse {pulse_idx} Current: {current_rounded} pA - Mean First/Last 3 ISIs ({base_filename})")
+                plt.legend()
+                plt.show()
+
+    # Allow user to select pulses to save to .txt file and perform linear fit
+    if file_freq_data:
+        saved_pulses = select_pulses_for_saving(file_freq_data, base_filename, valid_ap_times)
+        if not saved_pulses:
+            print(f"⚠️ No pulses selected for saving in {base_filename}, skipping export and linear fit.")
+        else:
+            freq_filename = f"{base_filename}_{safe_temp}_frequency_data.txt"
+            freq_path = os.path.join(output_dir, freq_filename)
+            with open(freq_path, 'w', encoding='utf-8', newline='\r\n') as f:
+                f.write(f"Original Data File: {base_filename}\n")
+                f.write("\n--- Frequency Data ---\n")
+                f.write(f"{'Applied Current (pA)':<25}\t{'Frequency First (Hz)':<20}\t{'Frequency Last (Hz)':<20}\n")
+                for data in saved_pulses:
+                    f.write(f"{data['current_amplitude']:<25}\t"
+                            f"{data['freq_first'] if not np.isnan(data['freq_first']) else 'NaN':<20}\t"
+                            f"{data['freq_last'] if not np.isnan(data['freq_last']) else 'NaN':<20}\n")
+            print(f"✅ Saved {len(saved_pulses)} pulses to: {freq_filename}")
+
+            # MODIFIED: Perform linear fit using only saved_pulses
+            currents = [data['current_amplitude'] for data in saved_pulses]
+            freq_first = [data['freq_first'] for data in saved_pulses]
+            freq_last = [data['freq_last'] for data in saved_pulses]
+
+            valid_first = [(c, f) for c, f in zip(currents, freq_first) if not np.isnan(f)]
+            valid_last = [(c, f) for c, f in zip(currents, freq_last) if not np.isnan(f)]
+
+            # Initialize fit parameters
+            slope_first, intercept_first, r2_first = np.nan, np.nan, np.nan
+            slope_last, intercept_last, r2_last = np.nan, np.nan, np.nan
+
+            plt.figure(figsize=(10, 6))
+            
+            if valid_first:
+                currents_first, freqs_first = zip(*valid_first)
+                slope_first, intercept_first = np.polyfit(currents_first, freqs_first, 1)
+                y_pred_first = slope_first * np.array(currents_first) + intercept_first
+                y_mean_first = np.mean(freqs_first)
+                ss_total_first = np.sum((np.array(freqs_first) - y_mean_first) ** 2)
+                ss_residual_first = np.sum((np.array(freqs_first) - y_pred_first) ** 2)
+                r2_first = 1 - (ss_residual_first / ss_total_first) if ss_total_first != 0 else 0
+                plt.scatter(currents_first, freqs_first, color='blue', label="Frequency First (Mean First 3 ISIs)")
+                plt.plot(currents_first, y_pred_first, color='blue', linestyle='--',
+                         label=f"First Fit: y={slope_first:.2f}x+{intercept_first:.2f}, R²={r2_first:.2f}")
+
+            if valid_last:
+                currents_last, freqs_last = zip(*valid_last)
+                slope_last, intercept_last = np.polyfit(currents_last, freqs_last, 1)
+                y_pred_last = slope_last * np.array(currents_last) + intercept_last
+                y_mean_last = np.mean(freqs_last)
+                ss_total_last = np.sum((np.array(freqs_last) - y_mean_last) ** 2)
+                ss_residual_last = np.sum((np.array(freqs_last) - y_pred_last) ** 2)
+                r2_last = 1 - (ss_residual_last / ss_total_last) if ss_total_last != 0 else 0
+                plt.scatter(currents_last, freqs_last, color='red', label="Frequency Last (Mean Last 3 ISIs)")
+                plt.plot(currents_last, y_pred_last, color='red', linestyle='--',
+                         label=f"Last Fit: y={slope_last:.2f}x+{intercept_last:.2f}, R²={r2_last:.2f}")
+
+            plt.xlabel("Applied Current (pA)")
+            plt.ylabel("Frequency (Hz)")
+            plt.title(f"Linear Fit of Frequency First and Last vs. Current ({base_filename}, {temperature})")
+            plt.legend()
+            plt.show()
+
+            # Save linear fit parameters to the .txt file
+            with open(freq_path, 'a', encoding='utf-8', newline='\r\n') as f:
+                f.write("\n--- Linear Fit Parameters ---\n")
+                f.write(f"{'Parameter':<25}\t{'Frequency First':<20}\t{'Frequency Last':<20}\n")
+                f.write(f"{'Slope':<25}\t"
+                        f"{slope_first if not np.isnan(slope_first) else 'NaN':<20}\t"
+                        f"{slope_last if not np.isnan(slope_last) else 'NaN':<20}\n")
+                f.write(f"{'Intercept':<25}\t"
+                        f"{intercept_first if not np.isnan(intercept_first) else 'NaN':<20}\t"
+                        f"{intercept_last if not np.isnan(intercept_last) else 'NaN':<20}\n")
+                f.write(f"{'R²':<25}\t"
+                        f"{r2_first if not np.isnan(r2_first) else 'NaN':<20}\t"
+                        f"{r2_last if not np.isnan(r2_last) else 'NaN':<20}\n")
+            print(f"✅ Saved linear fit parameters to: {freq_filename}")
+    else:
+        print(f"⚠️ No valid frequency data to save for {base_filename}, skipping export and linear fit.")
