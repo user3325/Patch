@@ -1,0 +1,174 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy.io
+from scipy.signal import find_peaks
+from scipy.interpolate import interp1d
+import tkinter as tk
+from tkinter import filedialog
+import os
+
+# Set up Tkinter root window (hidden)
+root = tk.Tk()
+root.withdraw()
+
+# File dialog
+file_path = filedialog.askopenfilename(title="Select a .mat file", filetypes=[("MATLAB files", "*.mat")])
+if not file_path:
+    print("❌ No file selected. Exiting.")
+    exit()
+
+# Directory to save output files
+output_dir = os.path.dirname(file_path)
+base_filename = os.path.splitext(os.path.basename(file_path))[0]
+
+# Load .mat file
+data = scipy.io.loadmat(file_path)
+
+# Detect voltage and current keys
+voltage_key = next((k for k in data if "Voltage" in k), None)
+current_key = next((k for k in data if "Current" in k), None)
+if not voltage_key or not current_key:
+    print("❌ Voltage or Current data not found!")
+    exit()
+
+# Extract data
+voltage_data = data[voltage_key][0, 0]
+current_data = data[current_key][0, 0]
+
+voltage_time = np.arange(0, voltage_data['length'][0][0] * voltage_data['interval'][0][0], voltage_data['interval'][0][0])[:len(voltage_data['values'])]
+current_time = np.arange(0, current_data['length'][0][0] * current_data['interval'][0][0], current_data['interval'][0][0])[:len(current_data['values'])]
+voltage_values = voltage_data['values'].flatten()
+current_values = current_data['values'].flatten()
+
+# Interpolate current to voltage time
+interp_func = interp1d(current_time, current_values, kind='linear', fill_value='extrapolate')
+current_values_resampled = interp_func(voltage_time)
+
+# Detect steps
+baseline_current = np.mean(current_values[current_time < 10])
+current_threshold = baseline_current + 2
+steps = []
+start_time = None
+for i in range(1, len(current_values_resampled)):
+    if current_values_resampled[i] > current_threshold and current_values_resampled[i - 1] <= current_threshold:
+        start_time = voltage_time[i]
+    if current_values_resampled[i] <= baseline_current and current_values_resampled[i - 1] > baseline_current and start_time is not None:
+        end_time = voltage_time[i]
+        if end_time - start_time >= 0.3:
+            amplitude = np.max(current_values_resampled[(voltage_time >= start_time) & (voltage_time <= end_time)]) - baseline_current
+            steps.append({'start_time': start_time, 'end_time': end_time, 'amplitude': amplitude})
+        start_time = None
+
+# Find APs with adjusted sensitivity (lower threshold, higher prominence)
+ap_indices, _ = find_peaks(voltage_values, height=-10, prominence=0.5)  # Lower height and prominence
+ap_times = voltage_time[ap_indices]
+
+# Initialize lists to store results
+slopes = []
+intercepts = []
+current_amplitudes = []
+num_aps = []
+ap_info = []
+
+# Loop through each step and plot individual pulse with AP detection
+previous_num_aps = 0  # Initialize the previous AP count
+for step in steps:
+    step_ap_indices = np.where((ap_times >= step['start_time']) & (ap_times <= step['end_time']))[0]
+    if len(step_ap_indices) >= 6:  # Only consider steps with at least 6 APs
+        # If the current number of APs is greater than the previous one, we include it
+        if len(step_ap_indices) > previous_num_aps:
+            # Create x_data as the time steps within the pulse
+            x_data = voltage_time[(voltage_time >= step['start_time']) & (voltage_time <= step['end_time'])]
+        
+            # Create y_data by assigning a value of 1 for each AP detected within the step window
+            y_data = np.zeros_like(x_data)
+            for i, time in enumerate(x_data):
+                # Count how many APs occurred up to the current time point
+                y_data[i] = np.sum((ap_times >= step['start_time']) & (ap_times <= time))
+        
+            # Plot the voltage trace and the detected APs for this pulse
+            plt.figure(figsize=(10, 6))
+            plt.plot(x_data, voltage_values[(voltage_time >= step['start_time']) & (voltage_time <= step['end_time'])], label="Voltage Trace", color='gray')
+            plt.axvspan(step['start_time'], step['end_time'], color='lightgreen', alpha=0.5, label="Current Step")
+            plt.scatter(ap_times[step_ap_indices], voltage_values[ap_indices[step_ap_indices]], color='red', label="Detected APs")
+            plt.xlabel("Time (s)")
+            plt.ylabel("Voltage (mV)")
+            plt.title(f"Pulse {len(current_amplitudes) + 1}: Current Step and Detected APs")
+            plt.legend()
+            plt.show()
+
+            # Collect data for the overall fit (pulse strength vs AP number)
+            current_amplitudes.append(step['amplitude'])
+            num_aps.append(len(step_ap_indices))
+
+            # Save AP number and corresponding pulse (start_time, end_time)
+            for ap_num in step_ap_indices:
+                ap_info.append({'current_amplitude': step['amplitude'], 'num_aps': len(step_ap_indices)})
+
+            # Update the previous_num_aps for the next comparison
+            previous_num_aps = len(step_ap_indices)
+
+# Now, perform the overall linear fit of pulse strength (current amplitude) vs AP number
+if len(current_amplitudes) > 0 and len(num_aps) > 0:
+    # Perform linear fit on the overall data (current strength vs AP count)
+    slope, intercept = np.polyfit(current_amplitudes, num_aps, 1)
+    
+    # Plot the overall fit
+    plt.figure(figsize=(10, 6))
+    plt.scatter(current_amplitudes, num_aps, color='blue', label="Pulse Strength vs AP Count")
+    plt.plot(current_amplitudes, slope * np.array(current_amplitudes) + intercept, color='red', label=f"Linear Fit: Slope={slope:.2f}, Intercept={intercept:.2f}")
+    plt.xlabel("Current Amplitude (pA)")
+    plt.ylabel("Number of APs")
+    plt.title("Pulse Strength (pA) vs AP Number with Linear Fit")
+    plt.legend()
+    plt.show()
+
+    # Save slope and intercept of the overall fit
+    fit_filename = f"{base_filename}_fit_slope_intercept.txt"
+    fit_path = os.path.join(output_dir, fit_filename)
+    with open(fit_path, 'w') as f:
+        f.write(f"Original Data File: {base_filename}\n")
+        f.write(f"Overall Linear Fit: Slope = {slope:.2f}, Intercept = {intercept:.2f}\n")
+
+    print(f"✅ Saved overall linear fit results to {fit_filename}")
+else:
+    print("❌ Not enough data to perform overall fit!")
+
+# Save AP information to a separate file, with current strength and number of APs in the requested format
+ap_info_filename = f"{base_filename}_ap_info.txt"
+ap_info_path = os.path.join(output_dir, ap_info_filename)
+
+# Structure the data correctly: Current vs AP number without duplicates, and round to the nearest 5 pA
+ap_info_data = []
+for step in steps:
+    step_ap_indices = np.where((ap_times >= step['start_time']) & (ap_times <= step['end_time']))[0]
+    if len(step_ap_indices) >= 6:  # Only consider steps with at least 6 APs
+        # Round the current amplitude to the nearest 5 pA and collect the data
+        current_rounded = 5 * round(step['amplitude'] / 5)
+        ap_info_data.append((current_rounded, len(step_ap_indices)))
+
+# Write the AP info to the file in the requested format
+with open(ap_info_path, 'w') as f:
+    f.write(f"Original Data File: {base_filename}\n")
+    f.write("\n--- AP Information ---\n")
+    f.write(f"{'Applied Current (pA)':<25} {'AP Number (Aps)'}\n")
+    for current, num_ap in ap_info_data:
+        f.write(f"{current:<25} {num_ap}\n")
+
+print(f"✅ Saved AP information to {ap_info_filename}")
+
+# Plot Overview of Entire Trace with Detected Pulses Labeled (with red dots only for pulses with APs)
+plt.figure(figsize=(12, 6))
+plt.plot(voltage_time, voltage_values, label="Voltage Trace", color='gray')
+
+# Mark only pulses with detected APs
+for i, step in enumerate(steps):
+    if len(np.where((ap_times >= step['start_time']) & (ap_times <= step['end_time']))[0]) > 0:
+        plt.plot(step['start_time'], voltage_values[(voltage_time == step['start_time'])][0], 'ro', label=f"Pulse {i+1} Start" if i == 0 else "")
+        plt.plot(step['end_time'], voltage_values[(voltage_time == step['end_time'])][0], 'ro', label=f"Pulse {i+1} End" if i == 0 else "")
+
+plt.xlabel("Time (s)")
+plt.ylabel("Voltage (mV)")
+plt.title("Overview of Voltage Trace with Detected Pulses (Red Dots)")
+plt.legend()
+plt.show()
